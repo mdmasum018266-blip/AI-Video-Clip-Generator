@@ -308,7 +308,7 @@ const ClipCard: React.FC<ClipCardProps> = ({
           transcriptText: clip.transcript.map((t) => t.text).join(" "),
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Could not generate hashtags");
       const cleaned = (Array.isArray(data.hashtags) ? data.hashtags : [])
         .map(normalizeHashtag)
@@ -354,7 +354,7 @@ const ClipCard: React.FC<ClipCardProps> = ({
           targetLanguage: targetLang,
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Translation failed");
 
       const rawTranscript = Array.isArray(data.transcript) ? data.transcript : [];

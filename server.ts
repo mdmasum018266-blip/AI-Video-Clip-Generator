@@ -119,16 +119,27 @@ function parseCookies(req: Request): Record<string, string> {
   return out;
 }
 
+function isHttpsRequest(req: Request): boolean {
+  if (req.secure) return true;
+  const protoHeader = req.headers["x-forwarded-proto"];
+  const proto = (Array.isArray(protoHeader) ? protoHeader[0] : protoHeader || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+  if (proto === "https") return true;
+  return getAppBaseUrl(req).startsWith("https://");
+}
+
 function getOrCreateSession(req: Request, res: Response): { sessionId: string; data: SessionData } {
   const cookies = parseCookies(req);
   let sid = cookies.sr_sid;
   if (!sid || !sessions.has(sid)) {
     sid = crypto.randomBytes(24).toString("hex");
     sessions.set(sid, { tokens: {} });
-    res.setHeader(
-      "Set-Cookie",
-      `sr_sid=${encodeURIComponent(sid)}; Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=604800`
-    );
+    const cookieAttrs = isHttpsRequest(req)
+      ? "Path=/; HttpOnly; Secure; SameSite=None; Partitioned; Max-Age=604800"
+      : "Path=/; HttpOnly; SameSite=Lax; Max-Age=604800";
+    res.setHeader("Set-Cookie", `sr_sid=${encodeURIComponent(sid)}; ${cookieAttrs}`);
   }
   return { sessionId: sid, data: sessions.get(sid)! };
 }
@@ -223,12 +234,55 @@ function parseReadableError(err: unknown): string {
   return raw;
 }
 
+function parseModelJson<T = Record<string, unknown>>(rawText: string | undefined): T {
+  const stripped = (rawText ?? "{}")
+    .trim()
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/i, "")
+    .trim();
+  try {
+    return JSON.parse(stripped) as T;
+  } catch {
+    const match = stripped.match(/\{[\s\S]*\}/);
+    if (match) {
+      return JSON.parse(match[0]) as T;
+    }
+    throw new Error("AI response was not valid JSON. Please try again.");
+  }
+}
+
+async function withAttemptTimeout<T>(
+  run: (signal: AbortSignal) => Promise<T>,
+  timeoutMs: number,
+  label: string
+): Promise<T> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      run(controller.signal),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error(`TIMEOUT: ${label} exceeded ${timeoutMs}ms`));
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function callGeminiWithFallback(
   ai: GoogleGenAI,
   params: Omit<GenerateContentParameters, "model">,
-  primaryModel = "gemini-4-hydrogen"
+  primaryModel = "gemini-4-hydrogen",
+  attemptTimeoutMs = 30000
 ) {
-  const modelsToTry = [primaryModel, "gemini-3.1-flash-lite"];
+  const modelsToTry =
+    primaryModel === "gemini-3.1-flash-lite"
+      ? ["gemini-3.1-flash-lite"]
+      : [primaryModel, "gemini-3.1-flash-lite"];
   let lastError: unknown;
 
   for (const model of modelsToTry) {
@@ -247,25 +301,38 @@ async function callGeminiWithFallback(
     }
 
     try {
-      return await ai.models.generateContent({
-        ...params,
-        model,
-        config: configWithThinking,
-      });
+      return await withAttemptTimeout(
+        (signal) =>
+          ai.models.generateContent({
+            ...params,
+            model,
+            config: {
+              ...configWithThinking,
+              abortSignal: signal,
+            },
+          }),
+        attemptTimeoutMs,
+        model
+      );
     } catch (err) {
       lastError = err;
       const msg = err instanceof Error ? err.message : String(err);
       const isTransient =
+        msg.includes("TIMEOUT") ||
+        msg.includes("DEADLINE_EXCEEDED") ||
         msg.includes("503") ||
+        msg.includes("504") ||
         msg.includes("UNAVAILABLE") ||
         msg.includes("429") ||
         msg.includes("RESOURCE_EXHAUSTED") ||
-        msg.includes("high demand");
+        msg.includes("high demand") ||
+        msg.includes("fetch failed") ||
+        msg.includes("AbortError");
 
       if (!isTransient) {
         throw err;
       }
-      await new Promise((r) => setTimeout(r, 350));
+      await new Promise((r) => setTimeout(r, 250));
     }
   }
 
@@ -837,7 +904,8 @@ async function startServer() {
 
     try {
       if (key === "youtube") {
-        // Resumable upload to YouTube Shorts
+        // Resumable upload to YouTube Shorts (max title length is 100 chars)
+        const ytTitle = `${safeTitle.slice(0, 92).trim()} #Shorts`.slice(0, 100);
         const initRes = await fetch(
           "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
           {
@@ -850,7 +918,7 @@ async function startServer() {
             },
             body: JSON.stringify({
               snippet: {
-                title: `${safeTitle} #Shorts`,
+                title: ytTitle,
                 description: safeCaption,
                 categoryId: "22",
               },
@@ -957,12 +1025,14 @@ async function startServer() {
         const regData = (await regRes.json()) as {
           value?: {
             video?: string;
+            uploadToken?: string;
             uploadInstructions?: Array<{ uploadUrl: string }>;
           };
           message?: string;
         };
         const uploadUrl = regData.value?.uploadInstructions?.[0]?.uploadUrl;
         const videoUrn = regData.value?.video;
+        const uploadToken = regData.value?.uploadToken || "";
         if (!regRes.ok || !uploadUrl || !videoUrn) {
           throw new Error(regData.message || "LinkedIn video init failed");
         }
@@ -974,10 +1044,65 @@ async function startServer() {
         if (!putRes.ok) {
           throw new Error(`LinkedIn binary upload failed (${putRes.status})`);
         }
+        const etag = putRes.headers.get("etag")?.replace(/"/g, "");
+        const finRes = await fetch(
+          "https://api.linkedin.com/rest/videos?action=finalizeUpload",
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${token.accessToken}`,
+              "Content-Type": "application/json",
+              "LinkedIn-Version": "202405",
+            },
+            body: JSON.stringify({
+              finalizeUploadRequest: {
+                video: videoUrn,
+                uploadToken,
+                uploadedPartIds: etag ? [etag] : [],
+              },
+            }),
+          }
+        );
+        if (!finRes.ok) {
+          const finErr = await finRes.text().catch(() => "");
+          throw new Error(`LinkedIn video finalize failed (${finRes.status}): ${finErr}`);
+        }
+        const postRes = await fetch("https://api.linkedin.com/rest/posts", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token.accessToken}`,
+            "Content-Type": "application/json",
+            "LinkedIn-Version": "202405",
+            "X-Restli-Protocol-Version": "2.0.0",
+          },
+          body: JSON.stringify({
+            author: ownerUrn,
+            commentary: safeCaption,
+            visibility: "PUBLIC",
+            distribution: {
+              feedDistribution: "MAIN_FEED",
+              targetEntities: [],
+              thirdPartyDistributionChannels: [],
+            },
+            content: {
+              media: {
+                title: safeTitle,
+                id: videoUrn,
+              },
+            },
+            lifecycleState: "PUBLISHED",
+            isResharedDisabledByAuthor: false,
+          }),
+        });
+        if (!postRes.ok) {
+          const postErr = await postRes.text().catch(() => "");
+          throw new Error(`LinkedIn post publish failed (${postRes.status}): ${postErr}`);
+        }
+        const postUrn = postRes.headers.get("x-restli-id") || videoUrn;
         res.json({
           ok: true,
           platform: "LinkedIn",
-          remoteId: videoUrn,
+          remoteId: postUrn,
         });
         return;
       }
@@ -1102,7 +1227,7 @@ async function startServer() {
   app.post("/api/video/inspect", async (req, res) => {
     try {
       const { url } = req.body as { url?: string };
-      if (!url || typeof url !== "string") {
+      if (!url || typeof url !== "string" || !url.trim()) {
         res.status(400).json({ error: "Please provide a valid video URL." });
         return;
       }
@@ -1110,6 +1235,19 @@ async function startServer() {
       const trimmedUrl = /^https?:\/\//i.test(url.trim())
         ? url.trim()
         : `https://${url.trim()}`;
+      try {
+        const parsedInput = new URL(trimmedUrl);
+        if (
+          (parsedInput.protocol !== "http:" && parsedInput.protocol !== "https:") ||
+          (!parsedInput.hostname.includes(".") && parsedInput.hostname !== "localhost")
+        ) {
+          res.status(400).json({ error: "Please enter a valid video URL (e.g. youtube.com/watch?v=...)." });
+          return;
+        }
+      } catch {
+        res.status(400).json({ error: "Please enter a valid video URL." });
+        return;
+      }
       const youtubeId = extractYouTubeId(trimmedUrl);
       let title = "Untitled Video Stream";
       let channel = "Creator Channel";
@@ -1163,20 +1301,23 @@ async function startServer() {
                   tools: [{ googleSearch: {} }],
                 },
               },
-              "gemini-3.1-flash-lite"
+              "gemini-3.1-flash-lite",
+              10000
             );
-            const raw = searchRes.text ?? "";
-            const jsonMatch = raw.match(/\{[\s\S]*\}/);
-            if (jsonMatch) {
-              const parsed = JSON.parse(jsonMatch[0]);
-              if (parsed.title) title = String(parsed.title);
+            const parsed = parseModelJson<{
+              title?: string;
+              channel?: string;
+              durationSec?: number;
+              language?: string;
+              topicSummary?: string;
+            }>(searchRes.text);
+            if (parsed.title) title = String(parsed.title);
               if (parsed.channel) channel = String(parsed.channel);
               if (typeof parsed.durationSec === "number" && parsed.durationSec > 30) {
                 durationSec = Math.round(parsed.durationSec);
               }
               if (parsed.language) language = String(parsed.language);
-              if (parsed.topicSummary) topicSummary = String(parsed.topicSummary);
-            }
+            if (parsed.topicSummary) topicSummary = String(parsed.topicSummary);
           } catch {
             // Keep graceful defaults
           }
@@ -1260,6 +1401,7 @@ async function startServer() {
         Math.max(safeStart + 10, Math.floor(Number(timeframeEndSec) || safeDuration))
       );
 
+      const cueRangeText = safeClipCount >= 8 ? "3 to 4" : "4 to 5";
       const promptText = `You are ScaleReach's AI video clipping, moment-scoring, and transcription engine.
 Analyze the provided video source and extract EXACTLY ${safeClipCount} high-impact short-form clips ready for TikTok, Instagram Reels, and YouTube Shorts.
 
@@ -1281,10 +1423,10 @@ Requirements for EVERY clip:
 1. Return EXACTLY ${safeClipCount} clips ranked #1 through #${safeClipCount} from highest Virality Score to lowest (scores between 76 and 96).
 2. Spread startTimeSec and endTimeSec realistically across ${safeStart}..${safeEnd}, keeping endTimeSec <= ${safeEnd} and duration = endTimeSec - startTimeSec (between 10s and 65s).
 3. Provide a sharp, scroll-stopping "hookTitle" (3 to 7 words) suitable for an on-screen top banner.
-4. Provide realistic "hookStrength" (0-100) and "pacingScore" (0-100) plus a clear, specific 2-sentence "whyViral" explanation detailing why the opening 3 seconds hook viewers and how pacing sustains retention.
-5. Generate an authentic spoken "transcript" as an array of 4 to 6 timed cues covering the clip from startOffsetSec = 0 up to the clip's duration. Each cue must be 1-2 natural spoken sentences with 1-3 key "emphasisWords" from that cue for animated word highlighting.
+4. Provide realistic "hookStrength" (0-100) and "pacingScore" (0-100) plus a clear, concise 1-2 sentence "whyViral" explanation detailing why the opening hook grabs attention and sustains retention.
+5. Generate an authentic spoken "transcript" as an array of ${cueRangeText} timed cues covering the clip from startOffsetSec = 0 up to the clip's duration. Each cue must be 1-2 natural spoken sentences with 1-3 key "emphasisWords" from that cue for animated word highlighting.
 6. Write all titles, hooks, explanations, and transcript cues in ${language}.
-7. Identify the video's niche/type as "videoCategory" (e.g., "Podcast", "Tech & AI", "Travel Vlog", "Comedy", "Education", "Gaming", "Business") and generate 5 to 7 relevant short-form "hashtags" (each starting with #, no spaces, tailored to the video type, topic, and language).`;
+7. Identify the video's niche/type as "videoCategory" (e.g., "Podcast", "Tech & AI", "Travel Vlog", "Comedy", "Education", "Gaming", "Business") and generate 4 to 6 relevant short-form "hashtags" (each starting with #, no spaces, tailored to the video type, topic, and language).`;
 
       const generationConfig = {
         systemInstruction:
@@ -1355,54 +1497,76 @@ Requirements for EVERY clip:
       };
 
       let response;
+      const primaryAttemptTimeout = safeClipCount >= 8 ? 35000 : 28000;
       if (mediaBase64 && mediaMimeType) {
         try {
-          response = await callGeminiWithFallback(ai, {
-            contents: {
-              parts: [
-                {
-                  inlineData: {
-                    mimeType: mediaMimeType,
-                    data: mediaBase64,
+          response = await callGeminiWithFallback(
+            ai,
+            {
+              contents: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: mediaMimeType,
+                      data: mediaBase64,
+                    },
                   },
-                },
-                { text: promptText },
-              ],
+                  { text: promptText },
+                ],
+              },
+              config: generationConfig,
             },
-            config: generationConfig,
-          });
+            "gemini-3.1-flash-lite",
+            35000
+          );
         } catch (mediaErr) {
           console.warn(
             "Inline media generation failed, falling back to metadata prompt:",
             parseReadableError(mediaErr)
           );
-          response = await callGeminiWithFallback(ai, {
-            contents: { parts: [{ text: promptText }] },
-            config: generationConfig,
-          });
+          response = await callGeminiWithFallback(
+            ai,
+            {
+              contents: { parts: [{ text: promptText }] },
+              config: generationConfig,
+            },
+            "gemini-3.1-flash-lite",
+            30000
+          );
         }
       } else {
-        response = await callGeminiWithFallback(ai, {
-          contents: { parts: [{ text: promptText }] },
-          config: generationConfig,
-        });
+        response = await callGeminiWithFallback(
+          ai,
+          {
+            contents: { parts: [{ text: promptText }] },
+            config: generationConfig,
+          },
+          "gemini-4-hydrogen",
+          primaryAttemptTimeout
+        );
       }
 
-      const rawJson = (response.text ?? "{}").trim();
-      const parsed = JSON.parse(rawJson) as {
+      const parsed = parseModelJson<{
         summary?: string;
         clips?: Array<Record<string, unknown>>;
-      };
+      }>(response.text);
       if (Array.isArray(parsed.clips)) {
+        const windowSpan = Math.max(10, safeEnd - safeStart);
+        const maxClipStart = Math.max(safeStart, safeEnd - Math.min(10, windowSpan));
         parsed.clips = parsed.clips.slice(0, safeClipCount).map((clip) => {
-          const rawS = Math.max(0, Math.floor(Number(clip.startTimeSec) || 0));
-          const clampedStart = Math.min(rawS, Math.max(0, safeDuration - 10));
-          const rawE = Math.max(clampedStart + 10, Math.floor(Number(clip.endTimeSec) || clampedStart + 30));
-          const clampedEnd = Math.min(safeDuration, rawE);
+          const rawS = Math.floor(Number(clip.startTimeSec) || safeStart);
+          const clampedStart = Math.min(Math.max(safeStart, rawS), maxClipStart);
+          const rawE = Math.floor(
+            Number(clip.endTimeSec) || clampedStart + Math.min(30, windowSpan)
+          );
+          const clampedEnd = Math.min(
+            safeEnd,
+            Math.max(clampedStart + Math.min(5, windowSpan), rawE)
+          );
           return {
             ...clip,
             startTimeSec: clampedStart,
-            endTimeSec: Math.max(clampedStart + 5, clampedEnd),
+            endTimeSec: clampedEnd,
           };
         });
       }
@@ -1468,11 +1632,11 @@ Requirements:
       "gemini-3.1-flash-lite"
     );
 
-      const parsed = JSON.parse((response.text ?? "{}").trim()) as {
+      const parsed = parseModelJson<{
         videoCategory?: string;
         hashtags?: string[];
         suggestedCaption?: string;
-      };
+      }>(response.text);
 
       const cleanedTags = (Array.isArray(parsed.hashtags) ? parsed.hashtags : [])
         .map((t) => {
@@ -1550,7 +1714,7 @@ ${JSON.stringify({ title, hookTitle, transcript })}`,
         },
       });
 
-      const parsed = JSON.parse((response.text ?? "{}").trim());
+      const parsed = parseModelJson(response.text);
       res.json(parsed);
     } catch (err) {
       res.status(500).json({ error: parseReadableError(err) });
@@ -1620,7 +1784,7 @@ Respond concisely as ScaleReach's AI Clipping Copilot. If the user asks to apply
         },
       });
 
-      const parsed = JSON.parse((response.text ?? "{}").trim());
+      const parsed = parseModelJson(response.text);
       res.json(parsed);
     } catch (err) {
       res.status(500).json({ error: parseReadableError(err) });

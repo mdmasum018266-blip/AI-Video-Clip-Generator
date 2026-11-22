@@ -1,4 +1,6 @@
 import { ClipItem, VideoProject } from "../types";
+import { ASSET_IMAGES, normalizeAssetUrl } from "../data/assetImages";
+import { BACKGROUND_VIDEOS } from "../data/presets";
 import { apiUrl } from "./api";
 
 export function formatTime(seconds: number): string {
@@ -102,7 +104,7 @@ export async function renderWebmClipBlob(
     throw new Error("Canvas 2D context unavailable for video export.");
   }
 
-  const LOCAL_FALLBACK_THUMB = "/src/assets/images/demo_podcast_ai_1795261139145.jpg";
+  const LOCAL_FALLBACK_THUMB = ASSET_IMAGES.demoPodcastAi;
 
   const loadImage = (src: string): Promise<HTMLImageElement | null> =>
     new Promise((resolve) => {
@@ -134,9 +136,10 @@ export async function renderWebmClipBlob(
 
   let sourceVideo: HTMLVideoElement | null = null;
   let img: HTMLImageElement | null = null;
+  let splitBgImg: HTMLImageElement | null = null;
 
   // Always preload a fallback thumbnail so export never renders black frames
-  const thumbSrc = project.thumbnailUrl || LOCAL_FALLBACK_THUMB;
+  const thumbSrc = normalizeAssetUrl(project.thumbnailUrl, LOCAL_FALLBACK_THUMB);
   if (thumbSrc.startsWith("https://")) {
     img = await loadImage(apiUrl(`/api/video/thumbnail-proxy?url=${encodeURIComponent(thumbSrc)}`));
   }
@@ -147,9 +150,16 @@ export async function renderWebmClipBlob(
     img = await loadImage(LOCAL_FALLBACK_THUMB);
   }
 
+  if (clip.splitScreen && clip.aspectRatio === "9:16") {
+    const bgOption =
+      BACKGROUND_VIDEOS.find((b) => b.id === clip.splitScreenBgId) || BACKGROUND_VIDEOS[0];
+    splitBgImg = await loadImage(
+      normalizeAssetUrl(bgOption.thumbnailUrl, ASSET_IMAGES.bgGameplayRunner)
+    );
+  }
+
   if (project.localVideoUrl) {
     const vid = document.createElement("video");
-    vid.src = project.localVideoUrl;
     vid.muted = true;
     vid.playsInline = true;
     vid.preload = "auto";
@@ -189,6 +199,7 @@ export async function renderWebmClipBlob(
         }
       };
       vid.onerror = () => finish(false);
+      vid.src = project.localVideoUrl!;
     });
 
     if (ready && vid.videoWidth > 0) {
@@ -296,23 +307,31 @@ export async function renderWebmClipBlob(
       ctx.fillStyle = "#09090B";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+      const isSplitScreen = clip.splitScreen && clip.aspectRatio === "9:16";
+      const primaryRegionH = isSplitScreen ? canvas.height / 2 : canvas.height;
+
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, canvas.width, primaryRegionH);
+      ctx.clip();
+
       if (sourceVideo && sourceVideo.videoWidth > 0 && sourceVideo.readyState >= 2) {
         const scale =
           Math.max(
             canvas.width / sourceVideo.videoWidth,
-            canvas.height / sourceVideo.videoHeight
+            primaryRegionH / sourceVideo.videoHeight
           ) * clip.zoomScale;
         const drawW = sourceVideo.videoWidth * scale;
         const drawH = sourceVideo.videoHeight * scale;
         const overflowX = Math.max(0, drawW - canvas.width);
         const offsetX = -(overflowX * (clip.focalPointX / 100));
-        const offsetY = (canvas.height - drawH) / 2;
+        const offsetY = (primaryRegionH - drawH) / 2;
         ctx.drawImage(sourceVideo, offsetX, offsetY, drawW, drawH);
       } else if (img && img.naturalWidth > 0) {
         // Subtle Ken Burns motion so static-thumbnail exports do not appear frozen
         const motionZoom = 1 + Math.sin(progress * Math.PI) * 0.06;
         const scale =
-          Math.max(canvas.width / img.naturalWidth, canvas.height / img.naturalHeight) *
+          Math.max(canvas.width / img.naturalWidth, primaryRegionH / img.naturalHeight) *
           clip.zoomScale *
           motionZoom;
         const drawW = img.naturalWidth * scale;
@@ -321,8 +340,30 @@ export async function renderWebmClipBlob(
         const panShift = Math.sin(progress * Math.PI * 2) * 0.08;
         const clampedFocal = Math.min(100, Math.max(0, clip.focalPointX + panShift * 100));
         const offsetX = -(overflowX * (clampedFocal / 100));
-        const offsetY = (canvas.height - drawH) / 2;
+        const offsetY = (primaryRegionH - drawH) / 2;
         ctx.drawImage(img, offsetX, offsetY, drawW, drawH);
+      }
+      ctx.restore();
+
+      if (isSplitScreen && splitBgImg && splitBgImg.naturalWidth > 0) {
+        const bgTop = primaryRegionH;
+        const bgH = canvas.height - bgTop;
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, bgTop, canvas.width, bgH);
+        ctx.clip();
+        const driftZoom = 1.08 + Math.cos(progress * Math.PI * 2) * 0.04;
+        const bgScale =
+          Math.max(canvas.width / splitBgImg.naturalWidth, bgH / splitBgImg.naturalHeight) *
+          driftZoom;
+        const bgDrawW = splitBgImg.naturalWidth * bgScale;
+        const bgDrawH = splitBgImg.naturalHeight * bgScale;
+        const bgOverflowX = Math.max(0, bgDrawW - canvas.width);
+        const bgShift = (Math.sin(progress * Math.PI * 2) + 1) / 2;
+        const bgOffsetX = -(bgOverflowX * bgShift);
+        const bgOffsetY = bgTop + (bgH - bgDrawH) / 2;
+        ctx.drawImage(splitBgImg, bgOffsetX, bgOffsetY, bgDrawW, bgDrawH);
+        ctx.restore();
       }
 
       const grad = ctx.createLinearGradient(0, canvas.height * 0.45, 0, canvas.height);

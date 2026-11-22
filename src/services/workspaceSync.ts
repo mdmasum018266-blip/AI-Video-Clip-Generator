@@ -17,8 +17,9 @@ import {
   UsageEntry,
   VideoProject,
 } from "../types";
+import { ASSET_IMAGES, normalizeAssetUrl } from "../data/assetImages";
 
-const FALLBACK_THUMBNAIL = "/src/assets/images/demo_creator_editing_1795261138677.jpg";
+const FALLBACK_THUMBNAIL = ASSET_IMAGES.demoCreatorEditing;
 
 export function sanitizeDocId(rawId: string, prefix = "doc"): string {
   const cleaned = String(rawId || "")
@@ -37,7 +38,7 @@ function sanitizeThumbnail(url: string | undefined): string {
   if (!url || url.startsWith("data:") || url.startsWith("blob:") || url.length > 1950) {
     return FALLBACK_THUMBNAIL;
   }
-  return url;
+  return normalizeAssetUrl(url, FALLBACK_THUMBNAIL);
 }
 
 function stripUndefinedDeep<T>(value: T): T {

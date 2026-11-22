@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   X,
   Download,
@@ -42,12 +42,24 @@ export const ClipEditorModal: React.FC<ClipEditorModalProps> = ({
   onClose,
 }) => {
   const [draft, setDraft] = useState<ClipItem>(() => JSON.parse(JSON.stringify(clip)));
+  const [startInput, setStartInput] = useState(() => String(clip.startTimeSec));
+  const [endInput, setEndInput] = useState(() => String(clip.endTimeSec));
   const [tab, setTab] = useState<"framing" | "captions" | "translate">("framing");
   const [targetLang, setTargetLang] = useState("Spanish");
   const [isTranslating, setIsTranslating] = useState(false);
   const [translateErr, setTranslateErr] = useState<string | null>(null);
   const [renderPct, setRenderPct] = useState<number | null>(null);
   const [exportErr, setExportErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !isTranslating && renderPct === null) {
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isTranslating, renderPct, onClose]);
 
   const handleCueEdit = (idx: number, text: string) => {
     const updated = [...draft.transcript];
@@ -69,7 +81,7 @@ export const ClipEditorModal: React.FC<ClipEditorModalProps> = ({
           targetLanguage: targetLang,
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Translation failed");
 
       const rawTranscript = Array.isArray(data.transcript) ? data.transcript : [];
@@ -346,6 +358,35 @@ export const ClipEditorModal: React.FC<ClipEditorModalProps> = ({
                     project.durationSec || draft.endTimeSec
                   );
                   const maxStart = Math.max(0, draft.endTimeSec - 10);
+
+                  const commitStart = () => {
+                    const parsed = Math.round(Number(startInput));
+                    const s =
+                      startInput.trim() !== "" && Number.isFinite(parsed)
+                        ? Math.min(maxStart, Math.max(0, parsed))
+                        : draft.startTimeSec;
+                    setStartInput(String(s));
+                    setDraft((prev) => ({
+                      ...prev,
+                      startTimeSec: s,
+                      durationSec: Math.max(10, prev.endTimeSec - s),
+                    }));
+                  };
+
+                  const commitEnd = () => {
+                    const parsed = Math.round(Number(endInput));
+                    const end =
+                      endInput.trim() !== "" && Number.isFinite(parsed)
+                        ? Math.min(maxProjectEnd, Math.max(draft.startTimeSec + 10, parsed))
+                        : draft.endTimeSec;
+                    setEndInput(String(end));
+                    setDraft((prev) => ({
+                      ...prev,
+                      endTimeSec: end,
+                      durationSec: Math.max(10, end - prev.startTimeSec),
+                    }));
+                  };
+
                   return (
                     <div className="pt-3 border-t border-[#22222A] grid grid-cols-2 gap-3">
                       <div className="space-y-1">
@@ -356,18 +397,9 @@ export const ClipEditorModal: React.FC<ClipEditorModalProps> = ({
                           type="number"
                           min={0}
                           max={maxStart}
-                          value={draft.startTimeSec}
-                          onChange={(e) => {
-                            const raw = Number(e.target.value);
-                            const s = Number.isFinite(raw)
-                              ? Math.min(maxStart, Math.max(0, raw))
-                              : 0;
-                            setDraft({
-                              ...draft,
-                              startTimeSec: s,
-                              durationSec: Math.max(10, draft.endTimeSec - s),
-                            });
-                          }}
+                          value={startInput}
+                          onChange={(e) => setStartInput(e.target.value)}
+                          onBlur={commitStart}
                           className="w-full px-3 py-2 rounded-lg bg-[#17171D] border border-[#272731] text-xs font-mono tabular-nums text-white"
                         />
                       </div>
@@ -379,21 +411,9 @@ export const ClipEditorModal: React.FC<ClipEditorModalProps> = ({
                           type="number"
                           min={draft.startTimeSec + 10}
                           max={maxProjectEnd}
-                          value={draft.endTimeSec}
-                          onChange={(e) => {
-                            const raw = Number(e.target.value);
-                            const end = Number.isFinite(raw)
-                              ? Math.min(
-                                  maxProjectEnd,
-                                  Math.max(draft.startTimeSec + 10, raw)
-                                )
-                              : draft.startTimeSec + 10;
-                            setDraft({
-                              ...draft,
-                              endTimeSec: end,
-                              durationSec: end - draft.startTimeSec,
-                            });
-                          }}
+                          value={endInput}
+                          onChange={(e) => setEndInput(e.target.value)}
+                          onBlur={commitEnd}
                           className="w-full px-3 py-2 rounded-lg bg-[#17171D] border border-[#272731] text-xs font-mono tabular-nums text-white"
                         />
                       </div>

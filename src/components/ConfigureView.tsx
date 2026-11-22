@@ -103,7 +103,7 @@ export const ConfigureView: React.FC<ConfigureViewProps> = ({
   const [userNotes, setUserNotes] = useState("");
   const [imgErr, setImgErr] = useState(false);
 
-  const minSpan = Math.min(60, Math.max(10, source.durationSec));
+  const minSpan = Math.min(10, Math.max(5, source.durationSec));
 
   const handleStartBlur = () => {
     const parsed = parseTimeInput(startText);
@@ -189,8 +189,10 @@ export const ConfigureView: React.FC<ConfigureViewProps> = ({
             </label>
             <select
               id="brand-tpl-select"
-              defaultValue=""
-              onChange={(e) => applyTemplate(e.target.value)}
+              value=""
+              onChange={(e) => {
+                if (e.target.value) applyTemplate(e.target.value);
+              }}
               className="bg-[#16161C] border border-[#2A2A34] rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none focus:border-blue-500"
             >
               <option value="" disabled>

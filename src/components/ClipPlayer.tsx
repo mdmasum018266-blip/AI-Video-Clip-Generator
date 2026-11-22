@@ -1,6 +1,7 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
 import { Pause, Play, Volume2, VolumeX, Film } from "lucide-react";
 import { ClipItem, VideoProject } from "../types";
+import { ASSET_IMAGES, normalizeAssetUrl } from "../data/assetImages";
 import { BACKGROUND_VIDEOS } from "../data/presets";
 import { CaptionPreview } from "./CaptionPreview";
 import { formatTime } from "../utils/exportClip";
@@ -93,6 +94,14 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
   const lastSpokenCueId = useRef<string | null>(null);
   const onTimeUpdateRef = useRef(onTimeUpdate);
   onTimeUpdateRef.current = onTimeUpdate;
+  const audioOnRef = useRef(audioOn);
+  audioOnRef.current = audioOn;
+  const currentTimeRef = useRef(currentTime);
+  currentTimeRef.current = currentTime;
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
+  const startTimeRef = useRef(clip.startTimeSec);
+  startTimeRef.current = clip.startTimeSec;
   const ytDomId = useId().replace(/:/g, "");
 
   useEffect(() => {
@@ -136,7 +145,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
             rel: 0,
             playsinline: 1,
             origin: typeof window !== "undefined" ? window.location.origin : "",
-            start: Math.floor(clip.startTimeSec),
+            start: Math.floor(startTimeRef.current),
           },
           events: {
             onReady: (e) => {
@@ -144,9 +153,16 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
               ready = true;
               window.clearTimeout(stallTimer);
               setYtReady(true);
-              if (!audioOn) e.target.mute();
+              if (!audioOnRef.current) e.target.mute();
               else e.target.unMute();
-              e.target.playVideo();
+              if (currentTimeRef.current > 0.2) {
+                e.target.seekTo(startTimeRef.current + currentTimeRef.current, true);
+              }
+              if (isPlayingRef.current) {
+                e.target.playVideo();
+              } else {
+                e.target.pauseVideo();
+              }
             },
             onStateChange: (e) => {
               if (cancelled) return;
@@ -188,7 +204,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       setYtReady(false);
       setYtPlaying(false);
     };
-  }, [useYouTubeEmbed, ytActivated, project.youtubeId, ytDomId, clip.startTimeSec]);
+  }, [useYouTubeEmbed, ytActivated, project.youtubeId, ytDomId]);
 
   // Sync mute state on YouTube or local video
   useEffect(() => {
@@ -340,10 +356,10 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
     );
   }, [clip.transcript, currentTime]);
 
-  // Web Speech API fallback only when neither local video nor active YouTube embed is playing
+  // Web Speech API fallback only when neither local video nor active YouTube embed is used
   useEffect(() => {
-    if (!audioOn || !isPlaying || useLocalVideo || (useYouTubeEmbed && ytPlaying)) {
-      if (!isPlaying && typeof window !== "undefined" && "speechSynthesis" in window) {
+    if (!audioOn || !isPlaying || useLocalVideo || (useYouTubeEmbed && !ytError)) {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }
       return;
@@ -357,7 +373,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
         window.speechSynthesis.speak(utter);
       }
     }
-  }, [audioOn, isPlaying, activeCue, useLocalVideo, useYouTubeEmbed, ytPlaying]);
+  }, [audioOn, isPlaying, activeCue, useLocalVideo, useYouTubeEmbed, ytError]);
 
   useEffect(() => {
     return () => {
@@ -369,7 +385,8 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
 
   const activeWordIndex = useMemo(() => {
     if (!activeCue || !isPlaying) return -1;
-    const words = activeCue.text.trim().split(/\s+/);
+    const words = activeCue.text.trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) return -1;
     const cueSpan = Math.max(0.5, activeCue.endOffsetSec - activeCue.startOffsetSec);
     const ratio = Math.min(0.99, Math.max(0, (currentTime - activeCue.startOffsetSec) / cueSpan));
     return Math.floor(ratio * words.length);
@@ -380,6 +397,15 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       BACKGROUND_VIDEOS.find((b) => b.id === clip.splitScreenBgId) || BACKGROUND_VIDEOS[0]
     );
   }, [clip.splitScreenBgId]);
+
+  const safeThumbnailUrl = useMemo(
+    () => normalizeAssetUrl(project.thumbnailUrl, ASSET_IMAGES.demoCreatorEditing),
+    [project.thumbnailUrl]
+  );
+  const safeSplitBgThumb = useMemo(
+    () => normalizeAssetUrl(splitBg.thumbnailUrl, ASSET_IMAGES.bgGameplayRunner),
+    [splitBg.thumbnailUrl]
+  );
 
   const aspectClass =
     clip.aspectRatio === "9:16"
@@ -435,9 +461,9 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       return (
         <div className="relative w-full h-full overflow-hidden bg-black">
           {/* Keep thumbnail visible until YouTube iframe is actively playing */}
-          {(!isPlaying || !ytPlaying) && project.thumbnailUrl && !imgFailed && (
+          {(!isPlaying || !ytPlaying) && safeThumbnailUrl && !imgFailed && (
             <img
-              src={project.thumbnailUrl}
+              src={safeThumbnailUrl}
               alt={clip.title}
               referrerPolicy="no-referrer"
               onError={() => setImgFailed(true)}
@@ -466,10 +492,10 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       );
     }
 
-    if (!imgFailed && project.thumbnailUrl) {
+    if (!imgFailed && safeThumbnailUrl) {
       return (
         <img
-          src={project.thumbnailUrl}
+          src={safeThumbnailUrl}
           alt={clip.title}
           referrerPolicy="no-referrer"
           onError={() => setImgFailed(true)}
@@ -504,7 +530,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
           </div>
           <div className="relative h-1/2 w-full overflow-hidden border-t border-black/60 bg-zinc-950">
             <img
-              src={splitBg.thumbnailUrl}
+              src={safeSplitBgThumb}
               alt={splitBg.name}
               referrerPolicy="no-referrer"
               className={`w-full h-full object-cover ${isPlaying ? "animate-bg-drift" : ""}`}

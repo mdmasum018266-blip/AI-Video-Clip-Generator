@@ -1252,15 +1252,21 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
           },
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || "Assistant request failed");
 
       let actionSummary = "";
       const act = data.action;
-      if (act && act.type === "switch_style" && act.captionStyle) {
+      const validStyles = new Set<string>(CAPTION_STYLES.map((s) => s.id));
+      const validAspects = new Set<string>(["9:16", "16:9", "1:1"]);
+      if (act && act.type === "switch_style" && validStyles.has(String(act.captionStyle || ""))) {
         onApplyStyle(activeProject.id, act.captionStyle as CaptionStyleId);
         actionSummary = `Applied caption style: ${act.captionStyle}`;
-      } else if (act && act.type === "switch_aspect" && act.aspectRatio) {
+      } else if (
+        act &&
+        act.type === "switch_aspect" &&
+        validAspects.has(String(act.aspectRatio || ""))
+      ) {
         onApplyAspect(activeProject.id, act.aspectRatio as AspectRatio);
         actionSummary = `Switched aspect ratio to ${act.aspectRatio}`;
       } else if (act && act.type === "open_clip_editor") {

@@ -40,6 +40,7 @@ import {
   INITIAL_SCHEDULED_POSTS,
   INITIAL_USAGE_HISTORY,
 } from "./data/presets";
+import { ASSET_IMAGES, normalizeAssetUrl } from "./data/assetImages";
 import { blobToBase64, renderWebmClipBlob } from "./utils/exportClip";
 import { buildSocialCaptionWithTags, normalizeHashtag } from "./utils/hashtags";
 import { apiUrl, getApiOrigin } from "./utils/api";
@@ -210,8 +211,8 @@ function inspectLocalMedia(
   file: File,
   objectUrl: string
 ): Promise<{ durationSec: number; thumbnailUrl: string }> {
-  const fallbackThumb = "/src/assets/images/demo_creator_editing_1795261138677.jpg";
-  const audioThumb = "/src/assets/images/demo_podcast_ai_1795261139145.jpg";
+  const fallbackThumb = ASSET_IMAGES.demoCreatorEditing;
+  const audioThumb = ASSET_IMAGES.demoPodcastAi;
 
   return new Promise((resolve) => {
     const isVideo =
@@ -220,7 +221,6 @@ function inspectLocalMedia(
     const el = document.createElement(isVideo ? "video" : "audio");
     el.preload = "metadata";
     el.muted = true;
-    el.src = objectUrl;
 
     let settled = false;
     let knownDuration = 300;
@@ -310,7 +310,23 @@ function inspectLocalMedia(
     el.onerror = () => {
       finish(knownDuration, isVideo ? fallbackThumb : audioThumb);
     };
+
+    el.src = objectUrl;
   });
+}
+
+function normalizeLoadedProject(p: VideoProject): VideoProject {
+  return {
+    ...p,
+    thumbnailUrl: normalizeAssetUrl(p.thumbnailUrl, ASSET_IMAGES.demoCreatorEditing),
+  };
+}
+
+function normalizeLoadedPost(p: ScheduledPost): ScheduledPost {
+  return {
+    ...p,
+    thumbnailUrl: normalizeAssetUrl(p.thumbnailUrl, ASSET_IMAGES.demoPodcastAi),
+  };
 }
 
 export default function App() {
@@ -323,7 +339,7 @@ export default function App() {
       if (saved) {
         const parsed = JSON.parse(saved);
         if (Array.isArray(parsed.projects) && parsed.projects.length > 0) {
-          return parsed.projects;
+          return (parsed.projects as VideoProject[]).map(normalizeLoadedProject);
         }
       }
     } catch {
@@ -350,7 +366,9 @@ export default function App() {
       const saved = localStorage.getItem(STORAGE_KEY);
       if (saved) {
         const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed.scheduledPosts)) return parsed.scheduledPosts;
+        if (Array.isArray(parsed.scheduledPosts)) {
+          return (parsed.scheduledPosts as ScheduledPost[]).map(normalizeLoadedPost);
+        }
       }
     } catch {
       // Ignore
@@ -438,11 +456,26 @@ export default function App() {
 
   const publishingLockRef = useRef(false);
   const activeGenTokenRef = useRef(0);
+  const routeRef = useRef<AppRoute>(route);
+  routeRef.current = route;
+  const oauthPollRef = useRef<number | null>(null);
+  const prevUidRef = useRef<string | null>(null);
   const localVideoUrlMapRef = useRef<Record<string, string>>({});
   const localThumbnailMapRef = useRef<Record<string, string>>({});
   const pendingCloudProjectsRef = useRef<Map<string, VideoProject>>(new Map());
 
   const isAdmin = useMemo(() => isUserAdmin(authUser), [authUser]);
+
+  const clearOauthPoll = useCallback(() => {
+    if (oauthPollRef.current !== null) {
+      window.clearInterval(oauthPollRef.current);
+      oauthPollRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => clearOauthPoll();
+  }, [clearOauthPoll]);
 
   const handleSignInGoogle = useCallback(async () => {
     setAuthLoading(true);
@@ -469,8 +502,31 @@ export default function App() {
       if (!user) {
         pendingCloudProjectsRef.current.clear();
         setAuthError(null);
+        if (prevUidRef.current !== null) {
+          prevUidRef.current = null;
+          setProjects(DEMO_PROJECTS);
+          setBrandTemplates(INITIAL_BRAND_TEMPLATES);
+          setScheduledPosts(INITIAL_SCHEDULED_POSTS);
+          setUsageHistory(INITIAL_USAGE_HISTORY);
+          setActiveProjectId(DEMO_PROJECTS[0]?.id ?? "");
+          setEditingClip(null);
+          setPostingClip(null);
+        }
         return;
       }
+
+      if (prevUidRef.current !== user.uid) {
+        prevUidRef.current = user.uid;
+        pendingCloudProjectsRef.current.clear();
+        setProjects(DEMO_PROJECTS);
+        setBrandTemplates(INITIAL_BRAND_TEMPLATES);
+        setScheduledPosts(INITIAL_SCHEDULED_POSTS);
+        setUsageHistory(INITIAL_USAGE_HISTORY);
+        setActiveProjectId(DEMO_PROJECTS[0]?.id ?? "");
+        setEditingClip(null);
+        setPostingClip(null);
+      }
+
       if (user && user.emailVerified) {
         try {
           const cloudPrefs = await ensureUserProfile(user, {
@@ -516,7 +572,12 @@ export default function App() {
             url: data.url ? String(data.url) : undefined,
             youtubeId: data.youtubeId ? String(data.youtubeId) : undefined,
             localVideoUrl: localVideoUrlMapRef.current[id],
-            thumbnailUrl: localThumbnailMapRef.current[id] || String(data.thumbnailUrl || ""),
+            thumbnailUrl:
+              localThumbnailMapRef.current[id] ||
+              normalizeAssetUrl(
+                data.thumbnailUrl ? String(data.thumbnailUrl) : "",
+                ASSET_IMAGES.demoCreatorEditing
+              ),
             durationSec: Number(data.durationSec) || 0,
             createdAt: String(data.createdAtLabel || "Today"),
             clipType: String(data.clipType || "Viral Clips"),
@@ -576,7 +637,10 @@ export default function App() {
             clipId: String(data.clipId || ""),
             clipTitle: String(data.clipTitle || ""),
             projectTitle: String(data.projectTitle || ""),
-            thumbnailUrl: String(data.thumbnailUrl || ""),
+            thumbnailUrl: normalizeAssetUrl(
+              data.thumbnailUrl ? String(data.thumbnailUrl) : "",
+              ASSET_IMAGES.demoPodcastAi
+            ),
             platform: (data.platform || "TikTok") as ScheduledPost["platform"],
             scheduledFor: String(data.scheduledFor || ""),
             captionText: String(data.captionText || ""),
@@ -646,11 +710,13 @@ export default function App() {
       if (!isTrusted) return;
 
       if (event.data?.type === "OAUTH_AUTH_SUCCESS") {
+        clearOauthPoll();
         setOauthError(null);
         setSetupGuideAccount(null);
         setConnectingPlatform(null);
         refreshSocialAccounts();
       } else if (event.data?.type === "OAUTH_AUTH_ERROR") {
+        clearOauthPoll();
         setConnectingPlatform(null);
         setOauthError(String(event.data?.error || "Social account connection failed."));
       }
@@ -658,7 +724,7 @@ export default function App() {
 
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
-  }, [refreshSocialAccounts]);
+  }, [refreshSocialAccounts, clearOauthPoll]);
 
   // Sync persistent workspace state (excluding ephemeral blob URLs)
   useEffect(() => {
@@ -723,8 +789,7 @@ export default function App() {
       sourceType: data.platform || "youtube",
       url: data.url,
       youtubeId: data.youtubeId || undefined,
-      thumbnailUrl:
-        data.thumbnailUrl || "/src/assets/images/demo_travel_vlog_1795261138763.jpg",
+      thumbnailUrl: normalizeAssetUrl(data.thumbnailUrl, ASSET_IMAGES.demoTravelVlog),
       title: data.title || "Imported Video",
       channel: data.channel || "Creator",
       durationSec: data.durationSec || 1260,
@@ -757,7 +822,7 @@ export default function App() {
     setQuickGeneratingLabel("Starting...");
     setProcessingMeta({
       title: "Fetching video from link...",
-      thumbnailUrl: "/src/assets/images/demo_travel_vlog_1795261138763.jpg",
+      thumbnailUrl: ASSET_IMAGES.demoTravelVlog,
       sourceType: "youtube",
       aspectRatio: "9:16",
       clipType: "Viral Clips",
@@ -821,11 +886,11 @@ export default function App() {
       const objectUrl = URL.createObjectURL(file);
       const { durationSec, thumbnailUrl } = await inspectLocalMedia(file, objectUrl);
 
-      // Attach inline base64 only for Gemini-supported media <= 10 MB so large files never stall upload
+      // Attach inline base64 only for Gemini-supported media <= 6 MB so large files never stall upload
       let mediaBase64: string | undefined;
       let mediaMimeType: string | undefined;
       const safeMime = inferGeminiMimeType(file);
-      if (safeMime && file.size <= 10 * 1024 * 1024) {
+      if (safeMime && file.size <= 6 * 1024 * 1024) {
         try {
           mediaBase64 = await readFileAsBase64(file);
           mediaMimeType = safeMime;
@@ -913,7 +978,7 @@ export default function App() {
             mediaMimeType: source.mediaMimeType,
           }),
         },
-        90000,
+        120000,
         "Clip generation timed out. For large videos, try trimming the timeframe or selecting fewer clips."
       );
 
@@ -1076,7 +1141,7 @@ export default function App() {
 
       setActiveProjectId(projectId);
       setTimeout(() => {
-        if (activeGenTokenRef.current === genToken) {
+        if (activeGenTokenRef.current === genToken && routeRef.current === "processing") {
           setRoute("clips");
         }
       }, 350);
@@ -1094,13 +1159,14 @@ export default function App() {
   };
 
   const handleConnectPlatform = async (platform: SocialPlatformKey) => {
+    clearOauthPoll();
     setOauthError(null);
     setConnectingPlatform(platform);
     try {
       const res = await fetch(apiUrl(`/api/social/auth/${platform}`), {
         credentials: "include",
       });
-      const data = (await res.json()) as {
+      const data = (await res.json().catch(() => ({}))) as {
         configured?: boolean;
         url?: string;
         platform?: SocialPlatformKey;
@@ -1137,9 +1203,20 @@ export default function App() {
             "Popup blocked by browser. Please allow popups for this site and click Connect again."
           );
           setConnectingPlatform(null);
+        } else {
+          oauthPollRef.current = window.setInterval(() => {
+            if (popup.closed) {
+              clearOauthPoll();
+              setConnectingPlatform((curr) => (curr === platform ? null : curr));
+              refreshSocialAccounts();
+            }
+          }, 500);
         }
+      } else {
+        setConnectingPlatform(null);
       }
     } catch (err) {
+      clearOauthPoll();
       setOauthError(err instanceof Error ? err.message : "OAuth setup error");
       setConnectingPlatform(null);
     }
@@ -1171,7 +1248,9 @@ export default function App() {
 
   const publishPostToChannel = useCallback(
     async (post: ScheduledPost, insertIfMissing = false) => {
-      if (publishingLockRef.current) return;
+      if (publishingLockRef.current) {
+        throw new Error("Another upload is currently in progress. Please wait a moment and try again.");
+      }
       publishingLockRef.current = true;
       setPublishingPostId(post.id);
       setPublishError(null);

@@ -82,6 +82,9 @@ export const ProcessingView: React.FC<ProcessingViewProps> = ({
                 src={meta.thumbnailUrl}
                 alt={meta.title}
                 referrerPolicy="no-referrer"
+                onError={(e) => {
+                  e.currentTarget.style.display = "none";
+                }}
                 className="w-full h-full object-cover opacity-80"
               />
             )}
