@@ -1,0 +1,86 @@
+@import "tailwindcss";
+
+@theme {
+  --font-display: "Plus Jakarta Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "DM Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+@layer base {
+  html,
+  body {
+    font-family: var(--font-sans);
+    background-color: #0a0a0c;
+    color: #f4f4f6;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: var(--font-display);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom sleek dark scrollbars */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0c;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27272e;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3a3a44;
+}
+
+/* Subtle Ken Burns motion for preview frames */
+@keyframes studioPan {
+  0% {
+    transform: scale(1.04) translate3d(0%, 0%, 0);
+  }
+  50% {
+    transform: scale(1.1) translate3d(-1.5%, -1%, 0);
+  }
+  100% {
+    transform: scale(1.04) translate3d(0%, 0%, 0);
+  }
+}
+
+@keyframes bgDrift {
+  0% {
+    transform: scale(1.05) translate3d(0, 0, 0);
+  }
+  50% {
+    transform: scale(1.12) translate3d(0, -2%, 0);
+  }
+  100% {
+    transform: scale(1.05) translate3d(0, 0, 0);
+  }
+}
+
+.animate-studio-pan {
+  animation: studioPan 14s ease-in-out infinite;
+}
+
+.animate-bg-drift {
+  animation: bgDrift 10s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-studio-pan,
+  .animate-bg-drift {
+    animation: none;
+  }
+}

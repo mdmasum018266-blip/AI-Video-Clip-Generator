@@ -1,0 +1,8 @@
+{
+  "name": "Remix ScaleReach — AI Video Clip Generator",
+  "description": "Turn long videos, podcasts, and YouTube links into ready-to-post short clips with AI moment scoring, animated captions, speaker reframing, translation, and social scheduling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

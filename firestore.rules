@@ -1,0 +1,279 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global safety net: default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'mdmasum018266@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll([
+        'uid', 'email', 'displayName', 'autoUploadEnabled', 'autoQueueTopClip', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'uid', 'email', 'displayName', 'photoURL', 'autoUploadEnabled', 'autoQueueTopClip', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.uid) &&
+      data.uid == userId &&
+      data.uid == request.auth.uid &&
+      data.email is string && data.email.size() <= 256 &&
+      data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 120 &&
+      (!('photoURL' in data) || (data.photoURL is string && data.photoURL.size() <= 500)) &&
+      data.autoUploadEnabled is bool &&
+      data.autoQueueTopClip is bool &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidVideoProject(data, projectId, userId) {
+      return data.keys().hasAll([
+        'id', 'ownerId', 'title', 'channel', 'sourceType', 'thumbnailUrl',
+        'durationSec', 'createdAtLabel', 'clipType', 'language',
+        'aspectRatio', 'captionStyle', 'autoHook', 'splitScreen',
+        'clips', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'ownerId', 'title', 'channel', 'sourceType', 'url', 'youtubeId',
+        'thumbnailUrl', 'durationSec', 'createdAtLabel', 'clipType', 'language',
+        'aspectRatio', 'captionStyle', 'autoHook', 'splitScreen',
+        'splitScreenBgId', 'isDemo', 'clips', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == projectId &&
+      isValidId(data.ownerId) &&
+      data.ownerId == userId &&
+      data.title is string && data.title.size() >= 1 && data.title.size() <= 200 &&
+      data.channel is string && data.channel.size() >= 1 && data.channel.size() <= 120 &&
+      data.sourceType in ['youtube', 'upload', 'twitch', 'drive', 'direct'] &&
+      (!('url' in data) || (data.url is string && data.url.size() <= 1000)) &&
+      (!('youtubeId' in data) || (data.youtubeId is string && data.youtubeId.size() <= 64)) &&
+      data.thumbnailUrl is string && data.thumbnailUrl.size() <= 2000 &&
+      data.durationSec is number && data.durationSec >= 0 && data.durationSec <= 86400 &&
+      data.createdAtLabel is string && data.createdAtLabel.size() <= 64 &&
+      data.clipType is string && data.clipType.size() <= 80 &&
+      data.language is string && data.language.size() <= 60 &&
+      data.aspectRatio in ['9:16', '16:9', '1:1'] &&
+      data.captionStyle is string && data.captionStyle.size() <= 40 &&
+      data.autoHook is bool &&
+      data.splitScreen is bool &&
+      (!('splitScreenBgId' in data) || (data.splitScreenBgId is string && data.splitScreenBgId.size() <= 64)) &&
+      (!('isDemo' in data) || data.isDemo is bool) &&
+      data.clips is list && data.clips.size() <= 15 &&
+      (data.clips.size() == 0 || data.clips[0] is map) &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidBrandTemplate(data, templateId, userId) {
+      return data.keys().hasAll([
+        'id', 'ownerId', 'name', 'captionStyle', 'aspectRatio',
+        'autoHook', 'accentHex', 'watermarkHandle', 'splitScreen',
+        'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'ownerId', 'name', 'captionStyle', 'aspectRatio',
+        'autoHook', 'accentHex', 'watermarkHandle', 'splitScreen',
+        'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == templateId &&
+      isValidId(data.ownerId) &&
+      data.ownerId == userId &&
+      data.name is string && data.name.size() >= 1 && data.name.size() <= 100 &&
+      data.captionStyle is string && data.captionStyle.size() <= 40 &&
+      data.aspectRatio in ['9:16', '16:9', '1:1'] &&
+      data.autoHook is bool &&
+      data.accentHex is string && data.accentHex.size() <= 16 &&
+      data.watermarkHandle is string && data.watermarkHandle.size() <= 60 &&
+      data.splitScreen is bool &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidScheduledPost(data, postId, userId) {
+      return data.keys().hasAll([
+        'id', 'ownerId', 'clipId', 'clipTitle', 'projectTitle',
+        'thumbnailUrl', 'platform', 'scheduledFor', 'captionText',
+        'status', 'createdAt', 'updatedAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'ownerId', 'clipId', 'clipTitle', 'projectTitle',
+        'thumbnailUrl', 'platform', 'scheduledFor', 'captionText',
+        'status', 'createdAt', 'updatedAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == postId &&
+      isValidId(data.ownerId) &&
+      data.ownerId == userId &&
+      data.clipId is string && data.clipId.size() >= 1 && data.clipId.size() <= 128 &&
+      data.clipTitle is string && data.clipTitle.size() >= 1 && data.clipTitle.size() <= 200 &&
+      data.projectTitle is string && data.projectTitle.size() >= 1 && data.projectTitle.size() <= 200 &&
+      data.thumbnailUrl is string && data.thumbnailUrl.size() <= 2000 &&
+      data.platform in ['TikTok', 'Instagram Reels', 'YouTube Shorts', 'LinkedIn', 'Facebook'] &&
+      data.scheduledFor is string && data.scheduledFor.size() <= 80 &&
+      data.captionText is string && data.captionText.size() <= 2200 &&
+      data.status in ['Scheduled', 'Published', 'Draft'] &&
+      data.createdAt is timestamp &&
+      data.updatedAt is timestamp;
+    }
+
+    function isValidUsageEntry(data, usageId, userId) {
+      return data.keys().hasAll([
+        'id', 'ownerId', 'projectTitle', 'dateLabel',
+        'minutesProcessed', 'clipsGenerated', 'sourceType', 'createdAt'
+      ]) &&
+      data.keys().hasOnly([
+        'id', 'ownerId', 'projectTitle', 'dateLabel',
+        'minutesProcessed', 'clipsGenerated', 'sourceType', 'createdAt'
+      ]) &&
+      isValidId(data.id) &&
+      data.id == usageId &&
+      isValidId(data.ownerId) &&
+      data.ownerId == userId &&
+      data.projectTitle is string && data.projectTitle.size() >= 1 && data.projectTitle.size() <= 200 &&
+      data.dateLabel is string && data.dateLabel.size() <= 64 &&
+      data.minutesProcessed is number && data.minutesProcessed >= 0 && data.minutesProcessed <= 10000 &&
+      data.clipsGenerated is number && data.clipsGenerated >= 0 && data.clipsGenerated <= 100 &&
+      data.sourceType is string && data.sourceType.size() <= 40 &&
+      data.createdAt is timestamp;
+    }
+
+    match /users/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId) &&
+        isOwner(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) &&
+        isValidUserProfile(incoming(), userId) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName', 'photoURL', 'email', 'autoUploadEnabled', 'autoQueueTopClip', 'updatedAt'
+          ]))
+        );
+      allow delete: if isValidId(userId) && isAdmin();
+
+      match /projects/{projectId} {
+        allow get: if isValidId(userId) && isValidId(projectId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && ((isVerifiedUser() && resource.data.ownerId == request.auth.uid) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(projectId) &&
+          isOwner(userId) &&
+          isValidVideoProject(incoming(), projectId, userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isValidId(userId) && isValidId(projectId) &&
+          isValidVideoProject(incoming(), projectId, userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time && (
+            isAdmin() ||
+            (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly([
+              'title', 'captionStyle', 'aspectRatio', 'autoHook', 'splitScreen',
+              'splitScreenBgId', 'clips', 'updatedAt'
+            ]))
+          );
+        allow delete: if isValidId(userId) && isValidId(projectId) && (isOwner(userId) || isAdmin());
+      }
+
+      match /brandTemplates/{templateId} {
+        allow get: if isValidId(userId) && isValidId(templateId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && ((isVerifiedUser() && resource.data.ownerId == request.auth.uid) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(templateId) &&
+          isOwner(userId) &&
+          isValidBrandTemplate(incoming(), templateId, userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isValidId(userId) && isValidId(templateId) &&
+          isValidBrandTemplate(incoming(), templateId, userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time && (
+            isAdmin() ||
+            (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly([
+              'name', 'captionStyle', 'aspectRatio', 'autoHook',
+              'accentHex', 'watermarkHandle', 'splitScreen', 'updatedAt'
+            ]))
+          );
+        allow delete: if isValidId(userId) && isValidId(templateId) && (isOwner(userId) || isAdmin());
+      }
+
+      match /scheduledPosts/{postId} {
+        allow get: if isValidId(userId) && isValidId(postId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && ((isVerifiedUser() && resource.data.ownerId == request.auth.uid) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(postId) &&
+          isOwner(userId) &&
+          isValidScheduledPost(incoming(), postId, userId) &&
+          incoming().createdAt == request.time &&
+          incoming().updatedAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+        allow update: if isValidId(userId) && isValidId(postId) &&
+          isValidScheduledPost(incoming(), postId, userId) &&
+          incoming().id == existing().id &&
+          incoming().ownerId == existing().ownerId &&
+          incoming().createdAt == existing().createdAt &&
+          incoming().updatedAt == request.time && (
+            isAdmin() ||
+            (
+              isOwner(userId) &&
+              existing().status != 'Published' &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'scheduledFor', 'captionText', 'status', 'updatedAt'
+              ])
+            )
+          );
+        allow delete: if isValidId(userId) && isValidId(postId) && (isOwner(userId) || isAdmin());
+      }
+
+      match /usageHistory/{usageId} {
+        allow get: if isValidId(userId) && isValidId(usageId) && (isOwner(userId) || isAdmin());
+        allow list: if isValidId(userId) && ((isVerifiedUser() && resource.data.ownerId == request.auth.uid) || isAdmin());
+        allow create: if isValidId(userId) && isValidId(usageId) &&
+          isOwner(userId) &&
+          isValidUsageEntry(incoming(), usageId, userId) &&
+          incoming().createdAt == request.time &&
+          exists(/databases/$(database)/documents/users/$(userId));
+        allow update, delete: if isValidId(userId) && isValidId(usageId) && isAdmin();
+      }
+    }
+  }
+}

@@ -1,0 +1,365 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile and workspace automation preferences.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "displayName": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "photoURL": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "autoUploadEnabled": {
+          "type": "boolean"
+        },
+        "autoQueueTopClip": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "uid",
+        "email",
+        "displayName",
+        "autoUploadEnabled",
+        "autoQueueTopClip",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "VideoProject": {
+      "title": "VideoProject",
+      "description": "A user's imported or uploaded video project and its generated short-form clips.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "title": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "channel": {
+          "type": "string",
+          "maxLength": 120
+        },
+        "sourceType": {
+          "type": "string",
+          "enum": ["youtube", "upload", "twitch", "drive", "direct"]
+        },
+        "url": {
+          "type": "string",
+          "maxLength": 1000
+        },
+        "youtubeId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "thumbnailUrl": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "durationSec": {
+          "type": "number"
+        },
+        "createdAtLabel": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "clipType": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "language": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "aspectRatio": {
+          "type": "string",
+          "enum": ["9:16", "16:9", "1:1"]
+        },
+        "captionStyle": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "autoHook": {
+          "type": "boolean"
+        },
+        "splitScreen": {
+          "type": "boolean"
+        },
+        "splitScreenBgId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "isDemo": {
+          "type": "boolean"
+        },
+        "clips": {
+          "type": "array",
+          "description": "Up to 15 generated clips belonging to this project."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "title",
+        "channel",
+        "sourceType",
+        "thumbnailUrl",
+        "durationSec",
+        "createdAtLabel",
+        "clipType",
+        "language",
+        "aspectRatio",
+        "captionStyle",
+        "autoHook",
+        "splitScreen",
+        "clips",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "BrandTemplate": {
+      "title": "BrandTemplate",
+      "description": "Reusable caption, framing, and watermark preset saved by a user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 100
+        },
+        "captionStyle": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "aspectRatio": {
+          "type": "string",
+          "enum": ["9:16", "16:9", "1:1"]
+        },
+        "autoHook": {
+          "type": "boolean"
+        },
+        "accentHex": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "watermarkHandle": {
+          "type": "string",
+          "maxLength": 60
+        },
+        "splitScreen": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "name",
+        "captionStyle",
+        "aspectRatio",
+        "autoHook",
+        "accentHex",
+        "watermarkHandle",
+        "splitScreen",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ScheduledPost": {
+      "title": "ScheduledPost",
+      "description": "A user's scheduled or published social media clip post.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "clipId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "clipTitle": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "projectTitle": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "thumbnailUrl": {
+          "type": "string",
+          "maxLength": 2000
+        },
+        "platform": {
+          "type": "string",
+          "enum": ["TikTok", "Instagram Reels", "YouTube Shorts", "LinkedIn", "Facebook"]
+        },
+        "scheduledFor": {
+          "type": "string",
+          "maxLength": 80
+        },
+        "captionText": {
+          "type": "string",
+          "maxLength": 2200
+        },
+        "status": {
+          "type": "string",
+          "enum": ["Scheduled", "Published", "Draft"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "clipId",
+        "clipTitle",
+        "projectTitle",
+        "thumbnailUrl",
+        "platform",
+        "scheduledFor",
+        "captionText",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UsageEntry": {
+      "title": "UsageEntry",
+      "description": "Immutable processing minute ledger entry for a user.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "projectTitle": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "dateLabel": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "minutesProcessed": {
+          "type": "number"
+        },
+        "clipsGenerated": {
+          "type": "number"
+        },
+        "sourceType": {
+          "type": "string",
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "ownerId",
+        "projectTitle",
+        "dateLabel",
+        "minutesProcessed",
+        "clipsGenerated",
+        "sourceType",
+        "createdAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User profile and workspace automation settings (owner-only PII isolation)."
+    },
+    "/users/{userId}/projects/{projectId}": {
+      "schema": { "$ref": "#/entities/VideoProject" },
+      "description": "User-owned video projects and generated clips."
+    },
+    "/users/{userId}/brandTemplates/{templateId}": {
+      "schema": { "$ref": "#/entities/BrandTemplate" },
+      "description": "User-owned reusable brand templates."
+    },
+    "/users/{userId}/scheduledPosts/{postId}": {
+      "schema": { "$ref": "#/entities/ScheduledPost" },
+      "description": "User-owned scheduled and published social posts."
+    },
+    "/users/{userId}/usageHistory/{usageId}": {
+      "schema": { "$ref": "#/entities/UsageEntry" },
+      "description": "User-owned processing minute usage history."
+    }
+  }
+}

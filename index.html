@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en" class="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <script>
+      window.addEventListener(
+        "error",
+        function (e) {
+          if (e && typeof e.filename === "string" && e.filename.indexOf("chrome-extension://") === 0) {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+          }
+        },
+        true
+      );
+    </script>
+    <title>AI Video Clip Generator</title>
+    <meta name="author" content="HBM" />
+    <meta name="tiktok-developers-site-verification" content="gxSwPPeOOK0BHXw2Ull9SlaF6NjouonY" />
+    <meta
+      name="description"
+      content="Turn long videos, podcasts, and YouTube links into ready-to-post short clips with AI moment scoring, animated captions, speaker reframing, translation, and social scheduling. Developed by HBM."
+    />
+    <meta property="og:title" content="AI Video Clip Generator" />
+    <meta
+      property="og:description"
+      content="Turn long videos into viral short clips with AI hook scoring, animated captions, and 9:16 reframing."
+    />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400..700;1,9..40,400..700&family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@500;600;700;800&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body class="bg-[#0A0A0C] text-[#F4F4F6] antialiased selection:bg-blue-600/30 selection:text-white">
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
