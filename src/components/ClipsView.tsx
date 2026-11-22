@@ -14,6 +14,7 @@ import {
   Loader2,
   FileText,
   Film,
+  Image as ImageIcon,
   Subtitles,
   CalendarClock,
   Youtube,
@@ -21,6 +22,7 @@ import {
   Share2,
   Hash,
   Sparkles,
+  Upload,
 } from "lucide-react";
 import {
   AspectRatio,
@@ -32,9 +34,13 @@ import {
 import { CAPTION_STYLES, SUPPORTED_LANGUAGES } from "../data/presets";
 import { ClipPlayer } from "./ClipPlayer";
 import {
+  downloadCoverPng,
   downloadSrtSubtitles,
   downloadTranscriptTxt,
+  downloadVttSubtitles,
   formatTime,
+  isDirectVideoUrl,
+  renderAndDownloadMp4Clip,
   renderAndDownloadWebmClip,
 } from "../utils/exportClip";
 import { getClipHashtags, normalizeHashtag } from "../utils/hashtags";
@@ -218,6 +224,9 @@ export const ClipsView: React.FC<ClipsViewProps> = ({
               project={project}
               compact={viewMode === "grid"}
               onUpdateClip={onUpdateClip}
+              onAttachSourceVideo={(url) =>
+                onUpdateProject({ ...project, localVideoUrl: url })
+              }
               onDelete={() => onDeleteClip(clip.id)}
               onEdit={() => onOpenEditor(clip)}
               onPost={(platform) => onOpenPostModal(clip, platform)}
@@ -234,6 +243,7 @@ interface ClipCardProps {
   project: VideoProject;
   compact: boolean;
   onUpdateClip: (clip: ClipItem) => void;
+  onAttachSourceVideo: (localVideoUrl: string) => void;
   onDelete: () => void;
   onEdit: () => void;
   onPost: (platform?: ScheduledPost["platform"]) => void;
@@ -244,6 +254,7 @@ const ClipCard: React.FC<ClipCardProps> = ({
   project,
   compact,
   onUpdateClip,
+  onAttachSourceVideo,
   onDelete,
   onEdit,
   onPost,
@@ -262,6 +273,12 @@ const ClipCard: React.FC<ClipCardProps> = ({
   const [tagErr, setTagErr] = useState<string | null>(null);
   const [copiedTags, setCopiedTags] = useState(false);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
+  const attachVideoInputRef = useRef<HTMLInputElement | null>(null);
+  const hasSourceVideoMedia = Boolean(
+    project.localVideoUrl ||
+      isDirectVideoUrl(project.url) ||
+      (!project.isDemo && (project.youtubeId || project.url))
+  );
 
   useEffect(() => {
     if (!exportOpen) return;
@@ -327,14 +344,37 @@ const ClipCard: React.FC<ClipCardProps> = ({
     }
   };
 
-  const handleVideoDownload = async () => {
+  const handleVideoDownload = async (format: "mp4" | "webm") => {
     setExportOpen(false);
     setExportErr(null);
     setRenderPct(0);
     try {
-      await renderAndDownloadWebmClip(clip, project, (pct) => setRenderPct(pct));
+      if (format === "mp4") {
+        await renderAndDownloadMp4Clip(clip, project, (pct) => setRenderPct(pct));
+      } else {
+        await renderAndDownloadWebmClip(clip, project, (pct) => setRenderPct(pct));
+      }
     } catch (err) {
-      setExportErr(err instanceof Error ? err.message : "Could not render WebM video.");
+      setExportErr(
+        err instanceof Error
+          ? err.message
+          : `Could not render ${format.toUpperCase()} video.`
+      );
+    } finally {
+      setRenderPct(null);
+    }
+  };
+
+  const handleCoverPngDownload = async () => {
+    setExportOpen(false);
+    setExportErr(null);
+    setRenderPct(0);
+    try {
+      await downloadCoverPng(clip, project);
+    } catch (err) {
+      setExportErr(
+        err instanceof Error ? err.message : "Could not export PNG cover image."
+      );
     } finally {
       setRenderPct(null);
     }
@@ -465,25 +505,71 @@ const ClipCard: React.FC<ClipCardProps> = ({
               </button>
 
               {exportOpen && (
-                <div className="absolute left-0 bottom-11 w-52 z-30 rounded-lg bg-[#18181F] border border-[#2D2D38] p-1.5 shadow-xl space-y-0.5">
+                <div className="absolute left-0 bottom-11 w-60 z-30 rounded-lg bg-[#18181F] border border-[#2D2D38] p-1.5 shadow-xl space-y-0.5">
                   <button
                     type="button"
-                    onClick={handleVideoDownload}
-                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center gap-2"
+                    disabled={renderPct !== null}
+                    onClick={() => handleVideoDownload("mp4")}
+                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 disabled:opacity-50 text-xs text-zinc-100 flex items-center justify-between gap-2"
                   >
-                    <Film className="w-3.5 h-3.5 text-blue-400" />
-                    Render Video (.webm)
+                    <span className="flex items-center gap-2 font-medium">
+                      <Film className="w-3.5 h-3.5 text-blue-400 shrink-0" />
+                      Video (.mp4)
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-400">H.264</span>
                   </button>
+                  <button
+                    type="button"
+                    disabled={renderPct !== null}
+                    onClick={() => handleVideoDownload("webm")}
+                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 disabled:opacity-50 text-xs text-zinc-100 flex items-center justify-between gap-2"
+                  >
+                    <span className="flex items-center gap-2 font-medium">
+                      <Film className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
+                      Video (.webm)
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-400">VP9</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={renderPct !== null}
+                    onClick={handleCoverPngDownload}
+                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 disabled:opacity-50 text-xs text-zinc-100 flex items-center justify-between gap-2"
+                  >
+                    <span className="flex items-center gap-2 font-medium">
+                      <ImageIcon className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                      Cover Image (.png)
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-400">Frame</span>
+                  </button>
+                  <div className="my-1 border-t border-[#282833]" />
                   <button
                     type="button"
                     onClick={() => {
                       downloadSrtSubtitles(clip);
                       setExportOpen(false);
                     }}
-                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center gap-2"
+                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center justify-between gap-2"
                   >
-                    <Subtitles className="w-3.5 h-3.5 text-emerald-400" />
-                    Subtitles (.srt)
+                    <span className="flex items-center gap-2">
+                      <Subtitles className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      Subtitles (.srt)
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-500">SubRip</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      downloadVttSubtitles(clip);
+                      setExportOpen(false);
+                    }}
+                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center justify-between gap-2"
+                  >
+                    <span className="flex items-center gap-2">
+                      <Subtitles className="w-3.5 h-3.5 text-violet-400 shrink-0" />
+                      Subtitles (.vtt)
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-500">WebVTT</span>
                   </button>
                   <button
                     type="button"
@@ -491,11 +577,45 @@ const ClipCard: React.FC<ClipCardProps> = ({
                       downloadTranscriptTxt(clip);
                       setExportOpen(false);
                     }}
-                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center gap-2"
+                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center justify-between gap-2"
                   >
-                    <FileText className="w-3.5 h-3.5 text-zinc-400" />
-                    Transcript (.txt)
+                    <span className="flex items-center gap-2">
+                      <FileText className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
+                      Transcript (.txt)
+                    </span>
+                    <span className="text-[10px] font-mono text-zinc-500">Text</span>
                   </button>
+                  <div className="my-1 border-t border-[#282833]" />
+                  {hasSourceVideoMedia ? (
+                    <div className="px-3 py-1.5 text-[10px] text-emerald-400/90 flex items-center justify-between">
+                      <span>Source video + audio ready</span>
+                      <span className="font-mono">720p</span>
+                    </div>
+                  ) : (
+                    <>
+                      <input
+                        ref={attachVideoInputRef}
+                        type="file"
+                        accept="video/*"
+                        className="hidden"
+                        onChange={(e) => {
+                          const file = e.target.files?.[0];
+                          if (!file) return;
+                          const url = URL.createObjectURL(file);
+                          onAttachSourceVideo(url);
+                          e.target.value = "";
+                        }}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => attachVideoInputRef.current?.click()}
+                        className="w-full text-left px-3 py-1.5 rounded hover:bg-white/5 text-[11px] text-amber-300 flex items-center gap-1.5"
+                      >
+                        <Upload className="w-3 h-3 shrink-0" />
+                        <span>Attach MP4 for full video+audio</span>
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
             </div>

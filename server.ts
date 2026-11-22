@@ -1,10 +1,17 @@
 import "dotenv/config";
+import { execFile } from "child_process";
 import crypto from "crypto";
 import express, { Request, Response } from "express";
+import ffmpegPath from "ffmpeg-static";
+import fs from "fs";
+import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
+import { promisify } from "util";
 import { createServer as createViteServer } from "vite";
 import { GenerateContentParameters, GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
+
+const execFileAsync = promisify(execFile);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -362,6 +369,247 @@ function extractYouTubeId(rawUrl: string): string | null {
     // Ignore invalid URL syntax
   }
   return null;
+}
+
+function isBlockedPrivateHost(rawHost: string): boolean {
+  const host = rawHost.toLowerCase().replace(/^\[|\]$/g, "");
+  return (
+    host === "localhost" ||
+    host === "127.0.0.1" ||
+    host === "0.0.0.0" ||
+    host === "::1" ||
+    host.endsWith(".local") ||
+    host.endsWith(".internal") ||
+    host.startsWith("10.") ||
+    host.startsWith("127.") ||
+    host.startsWith("169.254.") ||
+    host.startsWith("192.168.") ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+    /^(fe80:|fc|fd)/i.test(host)
+  );
+}
+
+const CLIP_CACHE_DIR = path.join(os.tmpdir(), "scalereach-clips");
+const YTDLP_TMP_BIN = path.join(os.tmpdir(), "yt-dlp");
+let ytDlpInstallPromise: Promise<string> | null = null;
+const inFlightClipExtractions = new Map<string, Promise<string>>();
+const probedDurationCache = new Map<string, number>();
+
+function getFfmpegExecutable(): string | null {
+  if (typeof ffmpegPath === "string" && ffmpegPath && fs.existsSync(ffmpegPath)) {
+    return ffmpegPath;
+  }
+  if (fs.existsSync("/usr/bin/ffmpeg")) return "/usr/bin/ffmpeg";
+  return null;
+}
+
+async function ensureYtDlpBinary(): Promise<string> {
+  for (const candidate of ["/usr/local/bin/yt-dlp", "/usr/bin/yt-dlp", YTDLP_TMP_BIN]) {
+    if (fs.existsSync(candidate)) {
+      try {
+        fs.accessSync(candidate, fs.constants.X_OK);
+        return candidate;
+      } catch {
+        // Not executable
+      }
+    }
+  }
+
+  if (!ytDlpInstallPromise) {
+    ytDlpInstallPromise = (async () => {
+      const res = await fetch(
+        "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp",
+        { redirect: "follow" }
+      );
+      if (!res.ok) {
+        throw new Error(`Failed to fetch yt-dlp (${res.status})`);
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      const tmpWrite = `${YTDLP_TMP_BIN}.${crypto.randomBytes(4).toString("hex")}`;
+      fs.writeFileSync(tmpWrite, buf, { mode: 0o755 });
+      fs.renameSync(tmpWrite, YTDLP_TMP_BIN);
+      return YTDLP_TMP_BIN;
+    })().finally(() => {
+      ytDlpInstallPromise = null;
+    });
+  }
+
+  return ytDlpInstallPromise;
+}
+
+async function probeVideoMetadataWithYtDlp(targetUrl: string): Promise<{
+  title?: string;
+  channel?: string;
+  durationSec?: number;
+  thumbnailUrl?: string;
+  language?: string;
+  topicSummary?: string;
+} | null> {
+  try {
+    const ytDlp = await ensureYtDlpBinary();
+    const { stdout } = await execFileAsync(
+      ytDlp,
+      [
+        "--js-runtimes",
+        `node:${process.execPath}`,
+        "--no-warnings",
+        "--no-playlist",
+        "--dump-single-json",
+        "--skip-download",
+        targetUrl,
+      ],
+      { timeout: 9000, maxBuffer: 8 * 1024 * 1024 }
+    );
+    const meta = JSON.parse(stdout) as {
+      title?: string;
+      uploader?: string;
+      channel?: string;
+      duration?: number;
+      thumbnail?: string;
+      language?: string;
+      description?: string;
+    };
+    const dur =
+      typeof meta.duration === "number" && Number.isFinite(meta.duration) && meta.duration > 0
+        ? Math.round(meta.duration)
+        : undefined;
+    if (dur) {
+      probedDurationCache.set(targetUrl, dur);
+    }
+    return {
+      title: meta.title || undefined,
+      channel: meta.channel || meta.uploader || undefined,
+      durationSec: dur,
+      thumbnailUrl: meta.thumbnail || undefined,
+      language: meta.language || undefined,
+      topicSummary: meta.description ? meta.description.slice(0, 320) : undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function pruneOldClipCache() {
+  try {
+    if (!fs.existsSync(CLIP_CACHE_DIR)) return;
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    for (const entry of fs.readdirSync(CLIP_CACHE_DIR)) {
+      const fullPath = path.join(CLIP_CACHE_DIR, entry);
+      try {
+        const st = fs.statSync(fullPath);
+        if (st.mtimeMs < cutoff) {
+          fs.unlinkSync(fullPath);
+        }
+      } catch {
+        // Ignore single-file cleanup error
+      }
+    }
+  } catch {
+    // Ignore cache prune errors
+  }
+}
+
+async function extractClipSourceSegment(
+  targetUrl: string,
+  requestedStartSec: number,
+  requestedDurationSec: number
+): Promise<string> {
+  fs.mkdirSync(CLIP_CACHE_DIR, { recursive: true });
+  pruneOldClipCache();
+
+  const safeDur = Math.min(Math.max(5, Number(requestedDurationSec) || 30), 65);
+  let safeStart = Math.max(0, Number(requestedStartSec) || 0);
+
+  let knownDur = probedDurationCache.get(targetUrl);
+  if (!knownDur) {
+    const probed = await probeVideoMetadataWithYtDlp(targetUrl);
+    if (probed?.durationSec) knownDur = probed.durationSec;
+  }
+  if (knownDur && knownDur > 5) {
+    safeStart = Math.min(safeStart, Math.max(0, knownDur - safeDur));
+  }
+
+  const endSec = safeStart + safeDur;
+  const cacheKey = crypto
+    .createHash("sha256")
+    .update(`${targetUrl}|${safeStart.toFixed(1)}|${endSec.toFixed(1)}`)
+    .digest("hex")
+    .slice(0, 24);
+  const finalMp4Path = path.join(CLIP_CACHE_DIR, `${cacheKey}.mp4`);
+
+  if (fs.existsSync(finalMp4Path) && fs.statSync(finalMp4Path).size > 10_000) {
+    return finalMp4Path;
+  }
+
+  const existing = inFlightClipExtractions.get(cacheKey);
+  if (existing) return existing;
+
+  const task = (async () => {
+    const ytDlp = await ensureYtDlpBinary();
+    const ffmpegBin = getFfmpegExecutable();
+    const tmpBase = path.join(
+      CLIP_CACHE_DIR,
+      `${cacheKey}-${crypto.randomBytes(4).toString("hex")}`
+    );
+    const tmpTemplate = `${tmpBase}.%(ext)s`;
+
+    const args = [
+      "--js-runtimes",
+      `node:${process.execPath}`,
+      "--no-warnings",
+      "--no-playlist",
+      ...(ffmpegBin ? ["--ffmpeg-location", ffmpegBin] : []),
+      "-f",
+      "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best",
+      "--download-sections",
+      `*${safeStart.toFixed(2)}-${endSec.toFixed(2)}`,
+      "--force-keyframes-at-cuts",
+      "--merge-output-format",
+      "mp4",
+      "-o",
+      tmpTemplate,
+      targetUrl,
+    ];
+
+    try {
+      await execFileAsync(ytDlp, args, {
+        timeout: 45000,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+
+      const produced = fs
+        .readdirSync(CLIP_CACHE_DIR)
+        .find((f) => f.startsWith(path.basename(tmpBase)) && /\.(mp4|mkv|webm)$/i.test(f));
+
+      if (!produced) {
+        throw new Error("Clip extraction produced no video output.");
+      }
+
+      const producedPath = path.join(CLIP_CACHE_DIR, produced);
+      if (fs.statSync(producedPath).size < 4096) {
+        fs.unlinkSync(producedPath);
+        throw new Error("Extracted clip segment was empty.");
+      }
+
+      fs.renameSync(producedPath, finalMp4Path);
+      return finalMp4Path;
+    } finally {
+      try {
+        for (const f of fs.readdirSync(CLIP_CACHE_DIR)) {
+          if (f.startsWith(path.basename(tmpBase))) {
+            fs.unlinkSync(path.join(CLIP_CACHE_DIR, f));
+          }
+        }
+      } catch {
+        // Ignore temp cleanup
+      }
+    }
+  })().finally(() => {
+    inFlightClipExtractions.delete(cacheKey);
+  });
+
+  inFlightClipExtractions.set(cacheKey, task);
+  return task;
 }
 
 async function startServer() {
@@ -1177,21 +1425,7 @@ async function startServer() {
         res.status(400).send("Only HTTPS thumbnail URLs are supported");
         return;
       }
-      const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-      if (
-        host === "localhost" ||
-        host === "127.0.0.1" ||
-        host === "0.0.0.0" ||
-        host === "::1" ||
-        host.endsWith(".local") ||
-        host.endsWith(".internal") ||
-        host.startsWith("10.") ||
-        host.startsWith("127.") ||
-        host.startsWith("169.254.") ||
-        host.startsWith("192.168.") ||
-        /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
-        /^(fe80:|fc|fd)/i.test(host)
-      ) {
+      if (isBlockedPrivateHost(parsed.hostname)) {
         res.status(403).send("Blocked host");
         return;
       }
@@ -1221,6 +1455,49 @@ async function startServer() {
       res.send(buf);
     } catch {
       res.status(502).send("Could not load thumbnail");
+    }
+  });
+
+  app.get("/api/video/clip-source", async (req, res) => {
+    try {
+      const rawUrl = String(req.query.url || "").trim();
+      if (!rawUrl || rawUrl.length > 2000) {
+        res.status(400).json({ error: "Missing video URL" });
+        return;
+      }
+
+      const normalizedUrl = /^https?:\/\//i.test(rawUrl) ? rawUrl : `https://${rawUrl}`;
+      let parsed: URL;
+      try {
+        parsed = new URL(normalizedUrl);
+      } catch {
+        res.status(400).json({ error: "Invalid video URL" });
+        return;
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        res.status(400).json({ error: "Only HTTP(S) video URLs are supported" });
+        return;
+      }
+      if (isBlockedPrivateHost(parsed.hostname)) {
+        res.status(403).json({ error: "Blocked host" });
+        return;
+      }
+
+      const startSec = Math.max(0, Number(req.query.start) || 0);
+      const durationSec = Math.min(Math.max(5, Number(req.query.duration) || 30), 65);
+      const ytId = extractYouTubeId(parsed.toString());
+      const targetUrl = ytId
+        ? `https://www.youtube.com/watch?v=${ytId}`
+        : parsed.toString();
+
+      const mp4Path = await extractClipSourceSegment(targetUrl, startSec, durationSec);
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Cache-Control", "private, max-age=1800");
+      res.sendFile(mp4Path);
+    } catch (err) {
+      res.status(502).json({
+        error: parseReadableError(err) || "Could not extract source video segment.",
+      });
     }
   });
 
@@ -1266,17 +1543,25 @@ async function startServer() {
 
       if (youtubeId) {
         const canonical = `https://www.youtube.com/watch?v=${youtubeId}`;
-        thumbnailUrl = `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`;
+        const maxResThumb = `https://i.ytimg.com/vi/${youtubeId}/maxresdefault.jpg`;
+        const sdThumb = `https://i.ytimg.com/vi/${youtubeId}/sddefault.jpg`;
+        const hqThumb = `https://i.ytimg.com/vi/${youtubeId}/hqdefault.jpg`;
+        thumbnailUrl = hqThumb;
 
         try {
           const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), 3500);
-          const oembedRes = await fetch(
-            `https://www.youtube.com/oembed?url=${encodeURIComponent(canonical)}&format=json`,
-            { signal: controller.signal }
-          );
+          const timer = setTimeout(() => controller.abort(), 4500);
+          const [oembedRes, maxResHead, probedMeta] = await Promise.all([
+            fetch(
+              `https://www.youtube.com/oembed?url=${encodeURIComponent(canonical)}&format=json`,
+              { signal: controller.signal }
+            ).catch(() => null),
+            fetch(maxResThumb, { method: "HEAD", signal: controller.signal }).catch(() => null),
+            probeVideoMetadataWithYtDlp(canonical),
+          ]);
           clearTimeout(timer);
-          if (oembedRes.ok) {
+
+          if (oembedRes && oembedRes.ok) {
             const data = (await oembedRes.json()) as {
               title?: string;
               author_name?: string;
@@ -1285,6 +1570,22 @@ async function startServer() {
             if (data.title) title = data.title;
             if (data.author_name) channel = data.author_name;
             if (data.thumbnail_url) thumbnailUrl = data.thumbnail_url;
+          }
+
+          if (probedMeta) {
+            if (probedMeta.title && title === "Untitled Video Stream") title = probedMeta.title;
+            if (probedMeta.channel && channel === "Creator Channel") channel = probedMeta.channel;
+            if (probedMeta.durationSec) durationSec = probedMeta.durationSec;
+            if (probedMeta.topicSummary) topicSummary = probedMeta.topicSummary;
+          }
+
+          if (maxResHead && maxResHead.ok) {
+            thumbnailUrl = maxResThumb;
+          } else {
+            const sdHead = await fetch(sdThumb, { method: "HEAD" }).catch(() => null);
+            if (sdHead && sdHead.ok) {
+              thumbnailUrl = sdThumb;
+            }
           }
         } catch {
           // Graceful fallback
@@ -1401,7 +1702,7 @@ async function startServer() {
         Math.max(safeStart + 10, Math.floor(Number(timeframeEndSec) || safeDuration))
       );
 
-      const cueRangeText = safeClipCount >= 8 ? "3 to 4" : "4 to 5";
+      const cueRangeText = safeClipCount >= 8 ? "5 to 7" : "6 to 10";
       const promptText = `You are ScaleReach's AI video clipping, moment-scoring, and transcription engine.
 Analyze the provided video source and extract EXACTLY ${safeClipCount} high-impact short-form clips ready for TikTok, Instagram Reels, and YouTube Shorts.
 
@@ -1421,10 +1722,10 @@ ${userNotes ? `- Transcript / Notes from Creator:\n${userNotes}` : ""}
 
 Requirements for EVERY clip:
 1. Return EXACTLY ${safeClipCount} clips ranked #1 through #${safeClipCount} from highest Virality Score to lowest (scores between 76 and 96).
-2. Spread startTimeSec and endTimeSec realistically across ${safeStart}..${safeEnd}, keeping endTimeSec <= ${safeEnd} and duration = endTimeSec - startTimeSec (between 10s and 65s).
+2. Spread startTimeSec and endTimeSec realistically across ${safeStart}..${safeEnd}, keeping endTimeSec <= ${safeEnd} and duration = endTimeSec - startTimeSec (between 15s and 60s).
 3. Provide a sharp, scroll-stopping "hookTitle" (3 to 7 words) suitable for an on-screen top banner.
 4. Provide realistic "hookStrength" (0-100) and "pacingScore" (0-100) plus a clear, concise 1-2 sentence "whyViral" explanation detailing why the opening hook grabs attention and sustains retention.
-5. Generate an authentic spoken "transcript" as an array of ${cueRangeText} timed cues covering the clip from startOffsetSec = 0 up to the clip's duration. Each cue must be 1-2 natural spoken sentences with 1-3 key "emphasisWords" from that cue for animated word highlighting.
+5. Generate an authentic spoken "transcript" as an array of ${cueRangeText} short, fast-paced cues (each 3 to 6 seconds long, 6 to 12 words max) covering the clip continuously from startOffsetSec = 0 up to the clip's duration. Each cue must include 1-3 key "emphasisWords" from that cue for animated word highlighting.
 6. Write all titles, hooks, explanations, and transcript cues in ${language}.
 7. Identify the video's niche/type as "videoCategory" (e.g., "Podcast", "Tech & AI", "Travel Vlog", "Comedy", "Education", "Gaming", "Business") and generate 4 to 6 relevant short-form "hashtags" (each starting with #, no spaces, tailored to the video type, topic, and language).`;
 
