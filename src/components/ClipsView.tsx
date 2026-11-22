@@ -38,6 +38,7 @@ import {
   renderAndDownloadWebmClip,
 } from "../utils/exportClip";
 import { getClipHashtags, normalizeHashtag } from "../utils/hashtags";
+import { apiUrl } from "../utils/api";
 
 interface ClipsViewProps {
   project: VideoProject;
@@ -295,7 +296,7 @@ const ClipCard: React.FC<ClipCardProps> = ({
     setIsGeneratingTags(true);
     setTagErr(null);
     try {
-      const res = await fetch("/api/clips/hashtags", {
+      const res = await fetch(apiUrl("/api/clips/hashtags"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -343,7 +344,7 @@ const ClipCard: React.FC<ClipCardProps> = ({
     setIsTranslating(true);
     setTranslateErr(null);
     try {
-      const res = await fetch("/api/clips/translate", {
+      const res = await fetch(apiUrl("/api/clips/translate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

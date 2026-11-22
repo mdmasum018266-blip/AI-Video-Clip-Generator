@@ -26,6 +26,7 @@ import {
   formatTime,
   renderAndDownloadWebmClip,
 } from "../utils/exportClip";
+import { apiUrl } from "../utils/api";
 
 interface ClipEditorModalProps {
   clip: ClipItem;
@@ -58,7 +59,7 @@ export const ClipEditorModal: React.FC<ClipEditorModalProps> = ({
     setIsTranslating(true);
     setTranslateErr(null);
     try {
-      const res = await fetch("/api/clips/translate", {
+      const res = await fetch(apiUrl("/api/clips/translate"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

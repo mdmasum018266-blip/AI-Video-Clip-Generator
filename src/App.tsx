@@ -42,6 +42,7 @@ import {
 } from "./data/presets";
 import { blobToBase64, renderWebmClipBlob } from "./utils/exportClip";
 import { buildSocialCaptionWithTags, normalizeHashtag } from "./utils/hashtags";
+import { apiUrl, getApiOrigin } from "./utils/api";
 import { Sidebar } from "./components/Sidebar";
 import { HomeView } from "./components/HomeView";
 import {
@@ -617,7 +618,7 @@ export default function App() {
 
   const refreshSocialAccounts = useCallback(async () => {
     try {
-      const res = await fetch("/api/social/accounts", { credentials: "same-origin" });
+      const res = await fetch(apiUrl("/api/social/accounts"), { credentials: "include" });
       if (!res.ok) return;
       const data = (await res.json()) as { accounts?: SocialAccountStatus[] };
       if (Array.isArray(data.accounts)) {
@@ -633,11 +634,14 @@ export default function App() {
   }, [refreshSocialAccounts]);
 
   useEffect(() => {
+    const apiOrigin = getApiOrigin();
     const onMessage = (event: MessageEvent) => {
       const origin = event.origin || "";
       const isTrusted =
         origin === window.location.origin ||
+        (apiOrigin !== null && origin === apiOrigin) ||
         origin.endsWith(".run.app") ||
+        origin.endsWith(".onrender.com") ||
         origin.includes("localhost");
       if (!isTrusted) return;
 
@@ -703,7 +707,7 @@ export default function App() {
 
   const inspectUrlSource = async (url: string): Promise<DraftVideoSource> => {
     const res = await fetchWithTimeout(
-      "/api/video/inspect",
+      apiUrl("/api/video/inspect"),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -886,7 +890,7 @@ export default function App() {
 
     try {
       const res = await fetchWithTimeout(
-        "/api/clips/generate",
+        apiUrl("/api/clips/generate"),
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -1093,8 +1097,8 @@ export default function App() {
     setOauthError(null);
     setConnectingPlatform(platform);
     try {
-      const res = await fetch(`/api/social/auth/${platform}`, {
-        credentials: "same-origin",
+      const res = await fetch(apiUrl(`/api/social/auth/${platform}`), {
+        credentials: "include",
       });
       const data = (await res.json()) as {
         configured?: boolean;
@@ -1145,9 +1149,9 @@ export default function App() {
     setOauthError(null);
     setConnectingPlatform(platform);
     try {
-      const res = await fetch(`/api/social/disconnect/${platform}`, {
+      const res = await fetch(apiUrl(`/api/social/disconnect/${platform}`), {
         method: "POST",
-        credentials: "same-origin",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
           "X-Requested-With": "ScaleReach",
@@ -1202,9 +1206,9 @@ export default function App() {
         setPublishStatusText(`Uploading "${matchedClip.title}" to ${post.platform}...`);
         const videoBase64 = await blobToBase64(blob);
 
-        const res = await fetch("/api/social/publish", {
+        const res = await fetch(apiUrl("/api/social/publish"), {
           method: "POST",
-          credentials: "same-origin",
+          credentials: "include",
           headers: {
             "Content-Type": "application/json",
             "X-Requested-With": "ScaleReach",

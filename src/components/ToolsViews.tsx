@@ -35,6 +35,7 @@ import {
 } from "../types";
 import { CAPTION_STYLES } from "../data/presets";
 import { formatTime } from "../utils/exportClip";
+import { apiUrl } from "../utils/api";
 import { CaptionPreview } from "./CaptionPreview";
 
 /* -------------------------------------------------------------------------- */
@@ -800,7 +801,7 @@ export const SocialSchedulerView: React.FC<SocialSchedulerViewProps> = ({
                       copyText(
                         `guide-cb-${setupGuideAccount.platform}`,
                         setupGuideAccount.callbackUrl ||
-                          `${window.location.origin}/api/social/callback/${setupGuideAccount.platform}`
+                          apiUrl(`/api/social/callback/${setupGuideAccount.platform}`)
                       )
                     }
                     className="px-3 py-1.5 rounded-lg bg-[#1A1A24] hover:bg-[#242432] border border-[#2C2C3A] text-zinc-200 font-medium inline-flex items-center gap-1.5"
@@ -932,7 +933,7 @@ export const SocialSchedulerView: React.FC<SocialSchedulerViewProps> = ({
                         </div>
                         <div className="flex items-center justify-between gap-2">
                           <code className="text-[10px] font-mono text-zinc-300 truncate">
-                            {acct.callbackUrl || `/api/social/callback/${acct.platform}`}
+                            {acct.callbackUrl || apiUrl(`/api/social/callback/${acct.platform}`)}
                           </code>
                           <button
                             type="button"
@@ -940,7 +941,7 @@ export const SocialSchedulerView: React.FC<SocialSchedulerViewProps> = ({
                               copyText(
                                 `cb-${acct.platform}`,
                                 acct.callbackUrl ||
-                                  `${window.location.origin}/api/social/callback/${acct.platform}`
+                                  apiUrl(`/api/social/callback/${acct.platform}`)
                               )
                             }
                             className="px-2 py-0.5 rounded bg-[#1E1E28] hover:bg-[#282836] text-[10px] text-zinc-200 shrink-0"
@@ -1231,7 +1232,7 @@ export const AiAssistantView: React.FC<AiAssistantViewProps> = ({
     setLoading(true);
 
     try {
-      const res = await fetch("/api/assistant/chat", {
+      const res = await fetch(apiUrl("/api/assistant/chat"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

@@ -133,17 +133,58 @@ function getOrCreateSession(req: Request, res: Response): { sessionId: string; d
   return { sessionId: sid, data: sessions.get(sid)! };
 }
 
+function getConfiguredAllowedOrigins(): string[] {
+  const raw = [process.env.FRONTEND_URL, process.env.ALLOWED_ORIGINS]
+    .filter(Boolean)
+    .join(",");
+  return raw
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((entry) => {
+      try {
+        return new URL(entry).origin;
+      } catch {
+        return entry.replace(/\/+$/, "");
+      }
+    });
+}
+
+function isAllowedCorsOrigin(origin: string, reqHostHeader?: string | string[]): boolean {
+  try {
+    const parsed = new URL(origin);
+    const reqHost = Array.isArray(reqHostHeader)
+      ? reqHostHeader[0]
+      : String(reqHostHeader || "").split(",")[0].trim();
+    if (reqHost && parsed.host === reqHost) return true;
+    if (getConfiguredAllowedOrigins().includes(parsed.origin)) return true;
+
+    const host = parsed.hostname.toLowerCase();
+    if (host === "localhost" || host === "127.0.0.1") return true;
+    if (
+      parsed.protocol === "https:" &&
+      (host.endsWith(".run.app") ||
+        host.endsWith(".onrender.com") ||
+        host.endsWith(".infinityfreeapp.com") ||
+        host.endsWith(".infinityfree.me") ||
+        host.endsWith(".epizy.com") ||
+        host.endsWith(".rf.gd") ||
+        host.endsWith(".great-site.net"))
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function verifyMutationOrigin(req: Request): boolean {
   if (req.headers["x-requested-with"] === "ScaleReach") return true;
   const origin = req.headers.origin;
   const host = req.headers["x-forwarded-host"] || req.headers.host;
-  if (!origin || !host) return false;
-  try {
-    const originHost = new URL(origin).host;
-    return originHost === String(host).split(",")[0].trim();
-  } catch {
-    return false;
-  }
+  if (!origin) return false;
+  return isAllowedCorsOrigin(origin, host);
 }
 
 function escapeHtmlText(str: string): string {
@@ -258,6 +299,22 @@ function extractYouTubeId(rawUrl: string): string | null {
 
 async function startServer() {
   const app = express();
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    const reqHost = req.headers["x-forwarded-host"] || req.headers.host;
+    if (origin && isAllowedCorsOrigin(origin, reqHost)) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Credentials", "true");
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Requested-With");
+    }
+    if (req.method === "OPTIONS") {
+      res.sendStatus(204);
+      return;
+    }
+    next();
+  });
   app.use(express.json({ limit: "32mb" }));
 
   app.get("/api/health", (_req, res) => {
@@ -676,6 +733,8 @@ async function startServer() {
       session.tokens[platformParam] = tokenRecord;
 
       const safePlatformJson = JSON.stringify(platformParam).replace(/</g, "\\u003c");
+      const fallbackUrl = process.env.FRONTEND_URL?.trim() || "/";
+      const safeFallbackJson = JSON.stringify(fallbackUrl).replace(/</g, "\\u003c");
       res.send(`
         <html>
           <body style="background:#0a0a0c;color:#f4f4f6;font-family:sans-serif;padding:24px;">
@@ -684,7 +743,7 @@ async function startServer() {
                 window.opener.postMessage({ type: 'OAUTH_AUTH_SUCCESS', platform: ${safePlatformJson} }, '*');
                 window.close();
               } else {
-                window.location.href = '/';
+                window.location.href = ${safeFallbackJson};
               }
             </script>
             <p>${escapeHtmlText(cfg.displayName)} connected. This window will close automatically.</p>

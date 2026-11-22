@@ -1,4 +1,5 @@
 import { ClipItem, VideoProject } from "../types";
+import { apiUrl } from "./api";
 
 export function formatTime(seconds: number): string {
   const safe = Math.max(0, Math.floor(seconds));
@@ -137,7 +138,7 @@ export async function renderWebmClipBlob(
   // Always preload a fallback thumbnail so export never renders black frames
   const thumbSrc = project.thumbnailUrl || LOCAL_FALLBACK_THUMB;
   if (thumbSrc.startsWith("https://")) {
-    img = await loadImage(`/api/video/thumbnail-proxy?url=${encodeURIComponent(thumbSrc)}`);
+    img = await loadImage(apiUrl(`/api/video/thumbnail-proxy?url=${encodeURIComponent(thumbSrc)}`));
   }
   if (!img) {
     img = await loadImage(thumbSrc);

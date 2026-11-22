@@ -15,6 +15,7 @@ import {
   getClipHashtags,
   normalizeHashtag,
 } from "../utils/hashtags";
+import { apiUrl } from "../utils/api";
 
 interface PostModalProps {
   clip: ClipItem;
@@ -79,7 +80,7 @@ export const PostModal: React.FC<PostModalProps> = ({
     setIsGeneratingTags(true);
     setError(null);
     try {
-      const res = await fetch("/api/clips/hashtags", {
+      const res = await fetch(apiUrl("/api/clips/hashtags"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
