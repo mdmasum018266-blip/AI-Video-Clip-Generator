@@ -109,16 +109,36 @@ interface ImageCropRect {
   sh: number;
 }
 
+interface SceneFrame {
+  img: HTMLImageElement;
+  crop: ImageCropRect | null;
+}
+
+interface AudioSegmentSlice {
+  audioBuffer: AudioBuffer;
+  startSample: number;
+  endSample: number;
+}
+
+export type ExportProgressCallback = (pct: number, stage?: string) => void;
+
 interface ExportCanvasResources {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
   img: HTMLImageElement | null;
   imgCrop: ImageCropRect | null;
+  sceneFrames: SceneFrame[];
   splitBgImg: HTMLImageElement | null;
   sourceVideo: HTMLVideoElement | null;
   videoSourceUrl: string | null;
   videoDurationSec: number;
   isPreCutSegment: boolean;
+  audioSegment: AudioSegmentSlice | null;
+  audioEnvelope: number[] | null;
+  effectiveRenderDurationSec: number;
+  captionTimeScale: number;
+  clipSourceError: string | null;
+  voiceoverError: string | null;
   cleanupSourceVideo: () => void;
 }
 
@@ -196,12 +216,413 @@ function extractYouTubeIdFromText(raw?: string): string | null {
   return null;
 }
 
+function computeAudioEnvelope(
+  audioBuffer: AudioBuffer,
+  startSample: number,
+  endSample: number,
+  bucketCount: number
+): number[] {
+  const totalSamples = Math.max(1, endSample - startSample);
+  const safeBuckets = Math.max(12, bucketCount);
+  const chData = audioBuffer.getChannelData(0);
+  const envelope: number[] = new Array(safeBuckets).fill(0);
+  let maxRms = 0.01;
+
+  for (let b = 0; b < safeBuckets; b++) {
+    const s0 = startSample + Math.floor((b / safeBuckets) * totalSamples);
+    const s1 = Math.min(endSample, Math.max(s0 + 1, startSample + Math.floor(((b + 1) / safeBuckets) * totalSamples)));
+    let sumSq = 0;
+    const step = Math.max(1, Math.floor((s1 - s0) / 64));
+    let count = 0;
+    for (let i = s0; i < s1; i += step) {
+      const val = chData[i] || 0;
+      sumSq += val * val;
+      count++;
+    }
+    const rms = count > 0 ? Math.sqrt(sumSq / count) : 0;
+    envelope[b] = rms;
+    if (rms > maxRms) maxRms = rms;
+  }
+
+  return envelope.map((v) => Math.min(1, v / maxRms));
+}
+
+async function fetchVoiceoverAudioBuffer(
+  clip: ClipItem
+): Promise<{ buffer: AudioBuffer | null; error: string | null }> {
+  if (typeof AudioContext === "undefined") {
+    return { buffer: null, error: "Web Audio API unavailable in this browser." };
+  }
+  const spokenScript =
+    clip.transcript
+      .map((c) => c.text.trim())
+      .filter(Boolean)
+      .join(" ")
+      .trim() ||
+    clip.hookTitle ||
+    clip.title;
+  if (!spokenScript) {
+    return { buffer: null, error: "No transcript text available for voiceover." };
+  }
+
+  let audioCtx: AudioContext | null = null;
+  try {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), 35000);
+    const res = await fetch(apiUrl("/api/clips/voiceover"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: spokenScript,
+        language: clip.language || "English",
+      }),
+      signal: controller.signal,
+    });
+    window.clearTimeout(timer);
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => null);
+      return {
+        buffer: null,
+        error: errJson?.error || `Voiceover request failed (${res.status})`,
+      };
+    }
+
+    const wavBytes = await res.arrayBuffer();
+    if (wavBytes.byteLength < 64) {
+      return { buffer: null, error: "Voiceover audio response was empty." };
+    }
+    audioCtx = new AudioContext();
+    const decoded = await audioCtx.decodeAudioData(wavBytes);
+    if (decoded.numberOfChannels === 0 || decoded.length === 0) {
+      return { buffer: null, error: "Decoded voiceover had no audio channels." };
+    }
+    return { buffer: decoded, error: null };
+  } catch (err) {
+    return {
+      buffer: null,
+      error: err instanceof Error ? err.message : "Failed to load AI voiceover.",
+    };
+  } finally {
+    if (audioCtx) {
+      audioCtx.close().catch(() => {});
+    }
+  }
+}
+
+async function resampleAudioSegment(
+  segment: AudioSegmentSlice,
+  targetSampleRate: number,
+  targetChannels?: number
+): Promise<AudioSegmentSlice> {
+  const { audioBuffer, startSample, endSample } = segment;
+  const channels = targetChannels ?? Math.min(2, audioBuffer.numberOfChannels);
+  if (
+    audioBuffer.sampleRate === targetSampleRate &&
+    audioBuffer.numberOfChannels === channels
+  ) {
+    return segment;
+  }
+  if (typeof OfflineAudioContext === "undefined") {
+    return segment;
+  }
+  const srcFrames = Math.max(1, endSample - startSample);
+  const srcDurationSec = srcFrames / audioBuffer.sampleRate;
+  const targetFrames = Math.max(1, Math.ceil(srcDurationSec * targetSampleRate));
+
+  const offline = new OfflineAudioContext(channels, targetFrames, targetSampleRate);
+  const srcChCount = Math.min(2, audioBuffer.numberOfChannels);
+  const sliceBuf = offline.createBuffer(channels, srcFrames, audioBuffer.sampleRate);
+  for (let ch = 0; ch < channels; ch++) {
+    const srcChannelIdx = ch < srcChCount ? ch : 0;
+    const src = audioBuffer.getChannelData(srcChannelIdx).subarray(startSample, endSample);
+    sliceBuf.getChannelData(ch).set(src);
+  }
+  const source = offline.createBufferSource();
+  source.buffer = sliceBuf;
+  source.connect(offline.destination);
+  source.start(0);
+  const rendered = await offline.startRendering();
+  return {
+    audioBuffer: rendered,
+    startSample: 0,
+    endSample: rendered.length,
+  };
+}
+
+function computeAudioPeakAmplitude(segment: AudioSegmentSlice): number {
+  const { audioBuffer, startSample, endSample } = segment;
+  let peak = 0;
+  for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+    const data = audioBuffer.getChannelData(ch);
+    const step = Math.max(1, Math.floor((endSample - startSample) / 16000));
+    for (let i = startSample; i < endSample; i += step) {
+      const v = Math.abs(data[i] || 0);
+      if (v > peak) peak = v;
+    }
+  }
+  return peak;
+}
+
+function normalizeAndAlignAudioSegment(
+  segment: AudioSegmentSlice,
+  targetDurationSec: number
+): AudioSegmentSlice | null {
+  const peak = computeAudioPeakAmplitude(segment);
+  if (peak < 0.0005) {
+    return null;
+  }
+
+  const { audioBuffer, startSample, endSample } = segment;
+  const sr = audioBuffer.sampleRate;
+  const channels = Math.min(2, Math.max(1, audioBuffer.numberOfChannels));
+  const targetFrames = Math.max(1, Math.round(targetDurationSec * sr));
+  const copyFrames = Math.min(targetFrames, Math.max(1, endSample - startSample));
+  const gain = peak < 0.45 ? Math.min(2.8, 0.85 / peak) : peak > 0.96 ? 0.94 / peak : 1;
+  const fadeSamples = Math.min(Math.floor(sr * 0.015), Math.floor(copyFrames / 4));
+
+  const outBuf = new AudioBuffer({
+    length: targetFrames,
+    numberOfChannels: channels,
+    sampleRate: sr,
+  });
+
+  for (let ch = 0; ch < channels; ch++) {
+    const src = audioBuffer.getChannelData(Math.min(ch, audioBuffer.numberOfChannels - 1));
+    const dst = outBuf.getChannelData(ch);
+    for (let i = 0; i < copyFrames; i++) {
+      let val = (src[startSample + i] || 0) * gain;
+      if (gain > 1 && Math.abs(val) > 0.85) {
+        val = Math.tanh(val);
+      }
+      if (fadeSamples > 0) {
+        if (i < fadeSamples) {
+          val *= i / fadeSamples;
+        } else if (i >= copyFrames - fadeSamples) {
+          val *= Math.max(0, (copyFrames - 1 - i) / fadeSamples);
+        }
+      }
+      dst[i] = Math.max(-0.98, Math.min(0.98, val));
+    }
+  }
+
+  return {
+    audioBuffer: outBuf,
+    startSample: 0,
+    endSample: targetFrames,
+  };
+}
+
+function sampleCanvasFrameSignature(canvas: HTMLCanvasElement): string {
+  const probe = document.createElement("canvas");
+  probe.width = 16;
+  probe.height = 16;
+  const pctx = probe.getContext("2d");
+  if (!pctx) return "";
+  pctx.drawImage(canvas, 0, 0, 16, 16);
+  const data = pctx.getImageData(0, 0, 16, 16).data;
+  let sig = "";
+  for (let i = 0; i < data.length; i += 8) {
+    const luma = Math.round(
+      (0.2126 * data[i] + 0.7152 * data[i + 1] + 0.0722 * data[i + 2]) / 12
+    );
+    sig += luma.toString(36);
+  }
+  return sig;
+}
+
+export interface Mp4ContainerInspection {
+  hasFtyp: boolean;
+  hasMoov: boolean;
+  hasMdat: boolean;
+  hasVideoTrack: boolean;
+  hasAudioTrack: boolean;
+}
+
+export function validateMp4ContainerBuffer(
+  buffer: ArrayBuffer,
+  requireAudio: boolean
+): Mp4ContainerInspection {
+  if (buffer.byteLength < 64) {
+    throw new Error("MP4 output buffer is too small to be a valid video file.");
+  }
+  const bytes = new Uint8Array(buffer);
+  const view = new DataView(buffer);
+
+  const readType = (offset: number): string =>
+    String.fromCharCode(
+      bytes[offset],
+      bytes[offset + 1],
+      bytes[offset + 2],
+      bytes[offset + 3]
+    );
+
+  const readBox = (
+    offset: number,
+    limit: number
+  ): { type: string; headerSize: number; boxEnd: number } | null => {
+    if (offset + 8 > limit) return null;
+    const rawSize = view.getUint32(offset, false);
+    const type = readType(offset + 4);
+    let totalSize = rawSize;
+    let headerSize = 8;
+    if (rawSize === 1) {
+      if (offset + 16 > limit) return null;
+      const hi = view.getUint32(offset + 8, false);
+      const lo = view.getUint32(offset + 12, false);
+      totalSize = hi * 4294967296 + lo;
+      headerSize = 16;
+    } else if (rawSize === 0) {
+      totalSize = limit - offset;
+    }
+    if (totalSize < headerSize || offset + totalSize > limit) {
+      return null;
+    }
+    return { type, headerSize, boxEnd: offset + totalSize };
+  };
+
+  let hasFtyp = false;
+  let hasMoov = false;
+  let hasMdat = false;
+  let hasVideoTrack = false;
+  let hasAudioTrack = false;
+
+  const containerBoxes = new Set(["moov", "trak", "mdia", "minf", "stbl", "udta", "edts"]);
+  const scanRange = (start: number, end: number, depth: number) => {
+    if (depth > 8) return;
+    let cursor = start;
+    while (cursor + 8 <= end) {
+      const box = readBox(cursor, end);
+      if (!box) break;
+      if (depth === 0) {
+        if (box.type === "ftyp") hasFtyp = true;
+        if (box.type === "moov") hasMoov = true;
+        if (box.type === "mdat" && box.boxEnd - (cursor + box.headerSize) > 64) {
+          hasMdat = true;
+        }
+      }
+      if (box.type === "hdlr" && cursor + box.headerSize + 12 <= box.boxEnd) {
+        const handlerType = readType(cursor + box.headerSize + 8);
+        if (handlerType === "vide") hasVideoTrack = true;
+        if (handlerType === "soun") hasAudioTrack = true;
+      }
+      if (containerBoxes.has(box.type)) {
+        scanRange(cursor + box.headerSize, box.boxEnd, depth + 1);
+      }
+      cursor = box.boxEnd;
+    }
+  };
+
+  scanRange(0, bytes.byteLength, 0);
+
+  if (!hasFtyp || !hasMoov || !hasMdat) {
+    throw new Error("MP4 container validation failed: missing ftyp, moov, or mdat atom.");
+  }
+  if (!hasVideoTrack) {
+    throw new Error("MP4 container validation failed: no playable video track found.");
+  }
+  if (requireAudio && !hasAudioTrack) {
+    throw new Error("MP4 container validation failed: audio track is missing from exported MP4.");
+  }
+
+  return { hasFtyp, hasMoov, hasMdat, hasVideoTrack, hasAudioTrack };
+}
+
+async function validateExportedMp4Blob(
+  blob: Blob,
+  options: { requireAudio: boolean; minDurationSec: number }
+): Promise<Mp4ContainerInspection> {
+  if (!blob || blob.size < 4096) {
+    throw new Error("Exported MP4 file was empty or incomplete.");
+  }
+  const ab = await blob.arrayBuffer();
+  const inspection = validateMp4ContainerBuffer(ab, options.requireAudio);
+
+  // Verify browser can actually parse metadata, dimensions, and playable duration
+  if (typeof document !== "undefined") {
+    const probeUrl = URL.createObjectURL(blob);
+    const probeVid = document.createElement("video");
+    probeVid.muted = true;
+    probeVid.playsInline = true;
+    probeVid.preload = "metadata";
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const finish = (err?: Error) => {
+          if (settled) return;
+          settled = true;
+          window.clearTimeout(timer);
+          if (err) reject(err);
+          else resolve();
+        };
+        const timer = window.setTimeout(
+          () => finish(new Error("Timed out verifying exported MP4 playback metadata.")),
+          6000
+        );
+        probeVid.onloadedmetadata = () => {
+          if (probeVid.videoWidth <= 0 || probeVid.videoHeight <= 0) {
+            finish(new Error("Exported MP4 has zero video dimensions."));
+            return;
+          }
+          if (!Number.isFinite(probeVid.duration) || probeVid.duration < Math.min(0.8, options.minDurationSec * 0.4)) {
+            finish(new Error("Exported MP4 duration is invalid or truncated."));
+            return;
+          }
+          finish();
+        };
+        probeVid.onerror = () => finish(new Error("Exported MP4 could not be decoded by the browser player."));
+        probeVid.src = probeUrl;
+      });
+    } finally {
+      probeVid.removeAttribute("src");
+      probeVid.load();
+      URL.revokeObjectURL(probeUrl);
+    }
+  }
+
+  // Verify audio track inside the finalized MP4 decodes non-silent samples when supported by Web Audio
+  if (options.requireAudio && typeof AudioContext !== "undefined") {
+    let audioCtx: AudioContext | null = null;
+    try {
+      audioCtx = new AudioContext();
+      const decoded = await audioCtx.decodeAudioData(ab.slice(0));
+      if (decoded.length === 0 || decoded.numberOfChannels === 0) {
+        throw new Error("Exported MP4 audio track decoded with zero samples.");
+      }
+      const peak = computeAudioPeakAmplitude({
+        audioBuffer: decoded,
+        startSample: 0,
+        endSample: decoded.length,
+      });
+      if (peak < 0.0003) {
+        throw new Error("Exported MP4 audio track was completely silent.");
+      }
+    } catch (err) {
+      // Only rethrow explicit silence/zero-sample failures; browsers that decode Opus-in-MP4
+      // natively in <video> may reject Opus in AudioContext.decodeAudioData.
+      if (
+        err instanceof Error &&
+        /(completely silent|zero samples|audio track is missing)/i.test(err.message)
+      ) {
+        throw err;
+      }
+    } finally {
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+      }
+    }
+  }
+
+  return inspection;
+}
+
 async function prepareExportCanvasResources(
   clip: ClipItem,
   project: VideoProject,
   requestedDurationSec = 30,
-  onProgress?: (pct: number) => void
+  onProgress?: ExportProgressCallback,
+  options: { includeAudio?: boolean; maxRenderSec?: number; allowSceneFallback?: boolean } = {}
 ): Promise<ExportCanvasResources> {
+  const { includeAudio = true, maxRenderSec = 65, allowSceneFallback = false } = options;
   const dims = getExportDimensions(clip.aspectRatio);
   const canvas = document.createElement("canvas");
   canvas.width = dims.width;
@@ -228,9 +649,9 @@ async function prepareExportCanvasResources(
         if (!done) {
           done = true;
           window.clearTimeout(timer);
-          // YouTube maxresdefault returns a 120x90 grey placeholder when missing
+          // YouTube returns a 120x90 grey placeholder when maxres/hq thumbnail slot doesn't exist
           const isYtPlaceholder =
-            src.includes("maxresdefault.jpg") &&
+            src.includes("ytimg.com") &&
             candidate.naturalWidth <= 120 &&
             candidate.naturalHeight <= 90;
           resolve(candidate.naturalWidth > 0 && !isYtPlaceholder ? candidate : null);
@@ -246,15 +667,27 @@ async function prepareExportCanvasResources(
       candidate.src = src;
     });
 
+  const loadRemoteOrLocalImage = async (candidateUrl: string): Promise<HTMLImageElement | null> => {
+    const resolvedSrc = candidateUrl.startsWith("https://")
+      ? apiUrl(`/api/video/thumbnail-proxy?url=${encodeURIComponent(candidateUrl)}`)
+      : candidateUrl;
+    let loaded = await loadImage(resolvedSrc);
+    if (!loaded && candidateUrl.startsWith("https://")) {
+      loaded = await loadImage(candidateUrl);
+    }
+    return loaded;
+  };
+
   let sourceVideo: HTMLVideoElement | null = null;
   let videoDurationSec = 0;
   let img: HTMLImageElement | null = null;
   let splitBgImg: HTMLImageElement | null = null;
+  const sceneFrames: SceneFrame[] = [];
 
   const thumbSrc = normalizeAssetUrl(project.thumbnailUrl, LOCAL_FALLBACK_THUMB);
   const ytId = project.youtubeId || extractYouTubeIdFromText(thumbSrc);
 
-  // Build ordered thumbnail candidates preferring HD 16:9 maxresdefault (no black bars)
+  // Build ordered primary thumbnail candidates preferring HD 16:9 maxresdefault (no black bars)
   const thumbCandidates: string[] = [];
   if (ytId) {
     thumbCandidates.push(`https://i.ytimg.com/vi/${ytId}/maxresdefault.jpg`);
@@ -265,25 +698,51 @@ async function prepareExportCanvasResources(
     thumbCandidates.push(LOCAL_FALLBACK_THUMB);
   }
 
-  for (const candidateUrl of thumbCandidates) {
-    const resolvedSrc = candidateUrl.startsWith("https://")
-      ? apiUrl(`/api/video/thumbnail-proxy?url=${encodeURIComponent(candidateUrl)}`)
-      : candidateUrl;
-    img = await loadImage(resolvedSrc);
-    if (!img && candidateUrl.startsWith("https://")) {
-      img = await loadImage(candidateUrl);
+  // Load primary thumbnail + additional YouTube storyboard scene frames in parallel
+  const primaryPromise = (async () => {
+    for (const candidateUrl of thumbCandidates) {
+      const loaded = await loadRemoteOrLocalImage(candidateUrl);
+      if (loaded) return loaded;
     }
-    if (img) break;
-  }
+    return null;
+  })();
 
+  const ytScenePromise: Promise<HTMLImageElement[]> = ytId
+    ? Promise.all(
+        [1, 2, 3].map(async (slot) => {
+          const hd = await loadRemoteOrLocalImage(`https://i.ytimg.com/vi/${ytId}/maxres${slot}.jpg`);
+          if (hd) return hd;
+          return loadRemoteOrLocalImage(`https://i.ytimg.com/vi/${ytId}/hq${slot}.jpg`);
+        })
+      ).then((arr) => arr.filter((x): x is HTMLImageElement => Boolean(x)))
+    : Promise.resolve([]);
+
+  const splitBgPromise =
+    clip.splitScreen && clip.aspectRatio === "9:16"
+      ? loadImage(
+          normalizeAssetUrl(
+            (BACKGROUND_VIDEOS.find((b) => b.id === clip.splitScreenBgId) || BACKGROUND_VIDEOS[0])
+              .thumbnailUrl,
+            ASSET_IMAGES.bgGameplayRunner
+          )
+        )
+      : Promise.resolve(null);
+
+  const [primaryImg, ytExtraImgs, resolvedSplitBg] = await Promise.all([
+    primaryPromise,
+    ytScenePromise,
+    splitBgPromise,
+  ]);
+
+  img = primaryImg;
+  splitBgImg = resolvedSplitBg;
   const imgCrop = img ? detectLetterboxCrop(img) : null;
 
-  if (clip.splitScreen && clip.aspectRatio === "9:16") {
-    const bgOption =
-      BACKGROUND_VIDEOS.find((b) => b.id === clip.splitScreenBgId) || BACKGROUND_VIDEOS[0];
-    splitBgImg = await loadImage(
-      normalizeAssetUrl(bgOption.thumbnailUrl, ASSET_IMAGES.bgGameplayRunner)
-    );
+  for (const frameImg of ytExtraImgs) {
+    sceneFrames.push({ img: frameImg, crop: detectLetterboxCrop(frameImg) });
+  }
+  if (img) {
+    sceneFrames.push({ img, crop: imgCrop });
   }
 
   let candidateVideoUrl =
@@ -291,16 +750,24 @@ async function prepareExportCanvasResources(
   let videoSourceUrl: string | null = null;
   let isPreCutSegment = false;
   let createdBlobUrl: string | null = null;
+  let preFetchedBlob: Blob | null = null;
+  let clipSourceError: string | null = null;
+  let voiceoverError: string | null = null;
 
-  // For YouTube / web video URL projects without a local file, fetch the real extracted MP4 segment
-  if (!candidateVideoUrl && !project.isDemo && (project.youtubeId || project.url)) {
+  const isSyntheticDemoUrl =
+    Boolean(project.isDemo) &&
+    !project.youtubeId &&
+    (!project.url || /watch\?v=demo_/i.test(project.url));
+
+  // For YouTube / web video URL projects without a local file, extract the real MP4 segment first
+  if (!candidateVideoUrl && !isSyntheticDemoUrl && (project.youtubeId || project.url)) {
     const remoteTarget = project.youtubeId
       ? `https://www.youtube.com/watch?v=${project.youtubeId}`
       : project.url!;
     try {
-      if (onProgress) onProgress(4);
+      onProgress?.(4, "Checking video...");
       const controller = new AbortController();
-      const fetchTimer = window.setTimeout(() => controller.abort(), 50000);
+      const fetchTimer = window.setTimeout(() => controller.abort(), 75000);
       const clipSrcUrl = apiUrl(
         `/api/video/clip-source?url=${encodeURIComponent(remoteTarget)}&start=${Math.max(
           0,
@@ -313,18 +780,31 @@ async function prepareExportCanvasResources(
       if (segRes.ok) {
         const segBlob = await segRes.blob();
         if (segBlob.size > 4096) {
+          preFetchedBlob = segBlob;
           createdBlobUrl = URL.createObjectURL(segBlob);
           candidateVideoUrl = createdBlobUrl;
           isPreCutSegment = true;
+        } else {
+          clipSourceError = "Extracted source clip segment was empty.";
         }
+      } else {
+        const errJson = await segRes.json().catch(() => null);
+        clipSourceError =
+          errJson?.error || `Source video extraction failed (${segRes.status}).`;
       }
-    } catch {
-      // Fallback smoothly to HD thumbnail mode if upstream stream cannot be extracted
+    } catch (err) {
+      clipSourceError =
+        err instanceof Error
+          ? err.name === "AbortError"
+            ? "Timed out waiting for source video stream."
+            : err.message
+          : "Could not extract source video segment.";
     }
-    if (onProgress) onProgress(12);
+    onProgress?.(8, "Checking video...");
   }
 
   if (candidateVideoUrl) {
+    onProgress?.(8, "Loading video...");
     const vid = document.createElement("video");
     vid.muted = true;
     vid.playsInline = true;
@@ -349,7 +829,7 @@ async function prepareExportCanvasResources(
         window.clearTimeout(timer);
         resolve(ok);
       };
-      const timer = window.setTimeout(() => finish(vid.readyState >= 2), 8000);
+      const timer = window.setTimeout(() => finish(vid.readyState >= 2), 12000);
 
       vid.onloadeddata = () => {
         const dur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 0;
@@ -374,11 +854,14 @@ async function prepareExportCanvasResources(
       vid.src = candidateVideoUrl;
     });
 
-    if (ready && vid.videoWidth > 0) {
+    if (ready && vid.videoWidth > 0 && vid.videoHeight > 0) {
       sourceVideo = vid;
       videoSourceUrl = candidateVideoUrl;
       videoDurationSec = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 0;
     } else {
+      if (!clipSourceError) {
+        clipSourceError = "Browser could not decode the video stream.";
+      }
       vid.pause();
       vid.removeAttribute("src");
       vid.load();
@@ -400,16 +883,133 @@ async function prepareExportCanvasResources(
     }
   };
 
+  if (!sourceVideo && !allowSceneFallback) {
+    cleanupSourceVideo();
+    if (isSyntheticDemoUrl) {
+      throw new Error(
+        "This sample demo project has no real video stream. Click 'Attach original MP4' or import a real YouTube/video file to export a full moving video."
+      );
+    }
+    throw new Error(
+      clipSourceError
+        ? `Real moving video is unavailable (${clipSourceError}). Click 'Attach original MP4' to export with your source video.`
+        : "Original moving video stream is unavailable for this clip. Click 'Attach original MP4' to export with moving frames."
+    );
+  }
+
+  let effectiveRenderDurationSec = requestedDurationSec;
+  if (sourceVideo && videoDurationSec > 1.5) {
+    const startOffset = isPreCutSegment
+      ? 0
+      : videoDurationSec > 2
+      ? Math.min(Math.max(0, clip.startTimeSec), Math.max(0, videoDurationSec - 2))
+      : 0;
+    const remainingSec = Math.max(1.5, videoDurationSec - startOffset);
+    effectiveRenderDurationSec = Math.min(requestedDurationSec, remainingSec);
+  }
+
+  let audioSegment: AudioSegmentSlice | null = null;
+  let audioEnvelope: number[] | null = null;
+  let captionTimeScale = 1;
+
+  if (includeAudio) {
+    onProgress?.(9, "Preparing audio...");
+    if (sourceVideo && videoSourceUrl) {
+      const targetStart = isPreCutSegment
+        ? 0
+        : videoDurationSec > 2
+        ? Math.min(Math.max(0, clip.startTimeSec), Math.max(0, videoDurationSec - 2))
+        : 0;
+      const extractedAudio = await extractClipAudioSegment(
+        videoSourceUrl,
+        targetStart,
+        effectiveRenderDurationSec,
+        preFetchedBlob
+      );
+      if (extractedAudio && computeAudioPeakAmplitude(extractedAudio) >= 0.0008) {
+        audioSegment = extractedAudio;
+      } else if (extractedAudio) {
+        voiceoverError = "Source video audio track was silent.";
+      }
+    }
+
+    // If source video had no audible audio track -> generate spoken AI voiceover via Gemini TTS
+    if (!audioSegment) {
+      onProgress?.(10, "Generating voiceover...");
+      const ttsResult = await fetchVoiceoverAudioBuffer(clip);
+      voiceoverError = ttsResult.error || voiceoverError;
+      const voiceoverBuffer = ttsResult.buffer;
+      if (voiceoverBuffer) {
+        const voiceDur = voiceoverBuffer.duration;
+        const cappedSamples = Math.min(
+          voiceoverBuffer.length,
+          Math.floor(maxRenderSec * voiceoverBuffer.sampleRate)
+        );
+        const candidateSlice: AudioSegmentSlice = {
+          audioBuffer: voiceoverBuffer,
+          startSample: 0,
+          endSample: cappedSamples,
+        };
+        if (computeAudioPeakAmplitude(candidateSlice) >= 0.0005) {
+          audioSegment = candidateSlice;
+          if (!sourceVideo && voiceDur >= 4) {
+            effectiveRenderDurationSec = Math.min(maxRenderSec, Math.max(5, voiceDur + 0.45));
+          }
+          const lastCueEnd = clip.transcript.reduce(
+            (max, cue) => Math.max(max, Number(cue.endOffsetSec) || 0),
+            0
+          );
+          if (lastCueEnd > 1 && voiceDur > 1) {
+            captionTimeScale = Math.min(1.6, Math.max(0.65, voiceDur / lastCueEnd));
+          }
+        } else {
+          voiceoverError = "Generated AI voiceover audio was silent.";
+        }
+      }
+    }
+
+    if (audioSegment) {
+      audioSegment = normalizeAndAlignAudioSegment(audioSegment, effectiveRenderDurationSec);
+    }
+
+    if (!audioSegment && !allowSceneFallback) {
+      cleanupSourceVideo();
+      throw new Error(
+        voiceoverError
+          ? `Audio export blocked: ${voiceoverError} (cannot export a silent MP4 without voiceover/audio).`
+          : "Audio export blocked: no audible source audio or AI voiceover was found for this clip."
+      );
+    }
+
+    if (audioSegment) {
+      audioEnvelope = computeAudioEnvelope(
+        audioSegment.audioBuffer,
+        audioSegment.startSample,
+        audioSegment.endSample,
+        Math.max(24, Math.round(effectiveRenderDurationSec * 24))
+      );
+    }
+  }
+
+  onProgress?.(12, "Preparing encoder...");
+
   return {
     canvas,
     ctx,
     img,
     imgCrop,
+    sceneFrames,
     splitBgImg,
     sourceVideo,
     videoSourceUrl,
     videoDurationSec,
     isPreCutSegment,
+    audioSegment,
+    audioEnvelope,
+    effectiveRenderDurationSec,
+    captionTimeScale,
+    clipSourceError,
+    voiceoverError,
     cleanupSourceVideo,
   };
 }
@@ -715,13 +1315,121 @@ function drawStyledCaptionsOverlay(
   ctx.restore();
 }
 
+function drawSceneImageFrame(
+  ctx: CanvasRenderingContext2D,
+  canvasWidth: number,
+  regionHeight: number,
+  clip: ClipItem,
+  frame: SceneFrame,
+  sceneProgress: number,
+  sceneIdx: number,
+  alpha = 1
+) {
+  const { img, crop } = frame;
+  if (!img || img.naturalWidth <= 0) return;
+
+  const sx = crop ? crop.sx : 0;
+  const sy = crop ? crop.sy : 0;
+  const sw = crop ? crop.sw : img.naturalWidth;
+  const sh = crop ? crop.sh : img.naturalHeight;
+
+  const movePattern = sceneIdx % 4;
+  let motionZoom = 1.05;
+  let focalShift = 0;
+  if (movePattern === 0) {
+    motionZoom = 1.04 + sceneProgress * 0.1;
+    focalShift = (sceneProgress - 0.5) * 14;
+  } else if (movePattern === 1) {
+    motionZoom = 1.14 - sceneProgress * 0.09;
+    focalShift = (0.5 - sceneProgress) * 16;
+  } else if (movePattern === 2) {
+    motionZoom = 1.06 + Math.sin(sceneProgress * Math.PI) * 0.08;
+    focalShift = (sceneProgress - 0.5) * 18;
+  } else {
+    motionZoom = 1.05 + sceneProgress * 0.11;
+    focalShift = Math.sin(sceneProgress * Math.PI) * 10;
+  }
+
+  const scale =
+    Math.max(canvasWidth / sw, regionHeight / sh) * clip.zoomScale * motionZoom;
+  const drawW = sw * scale;
+  const drawH = sh * scale;
+  const overflowX = Math.max(0, drawW - canvasWidth);
+  const clampedFocal = Math.min(100, Math.max(0, clip.focalPointX + focalShift));
+  const offsetX = -(overflowX * (clampedFocal / 100));
+  const offsetY = (regionHeight - drawH) / 2;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(img, sx, sy, sw, sh, offsetX, offsetY, drawW, drawH);
+  ctx.restore();
+}
+
+function drawVoiceoverWaveform(
+  ctx: CanvasRenderingContext2D,
+  canvas: HTMLCanvasElement,
+  audioEnvelope: number[] | null,
+  progress: number,
+  isSplitScreen: boolean,
+  scaleFactor: number
+) {
+  if (!audioEnvelope || audioEnvelope.length === 0) return;
+  const barCount = 28;
+  const barW = Math.max(3, Math.round(4 * scaleFactor));
+  const gap = Math.max(3, Math.round(4.5 * scaleFactor));
+  const totalW = barCount * barW + (barCount - 1) * gap;
+  const startX = Math.round((canvas.width - totalW) / 2);
+  const centerY = isSplitScreen
+    ? Math.round(canvas.height * 0.42)
+    : Math.round(canvas.height * 0.69);
+  const maxBarH = Math.round(28 * scaleFactor);
+
+  const envIdx = Math.min(
+    audioEnvelope.length - 1,
+    Math.max(0, Math.floor(progress * audioEnvelope.length))
+  );
+  const baseEnergy = audioEnvelope[envIdx] ?? 0.3;
+
+  ctx.save();
+  for (let i = 0; i < barCount; i++) {
+    const wave =
+      0.55 +
+      0.45 *
+        Math.abs(Math.sin(progress * Math.PI * 16 + i * 0.55 + (i % 3) * 0.8));
+    const envelopeSample =
+      audioEnvelope[
+        Math.min(audioEnvelope.length - 1, Math.max(0, envIdx + Math.round((i - barCount / 2) * 0.35)))
+      ] ?? baseEnergy;
+    const amp = Math.max(0.14, Math.min(1, (baseEnergy * 0.65 + envelopeSample * 0.35) * wave));
+    const h = Math.max(Math.round(5 * scaleFactor), Math.round(amp * maxBarH));
+    const x = startX + i * (barW + gap);
+    const y = Math.round(centerY - h / 2);
+
+    drawRoundedRectPath(ctx, x, y, barW, h, Math.round(barW / 2));
+    ctx.fillStyle =
+      amp > 0.62 ? "rgba(59, 130, 246, 0.92)" : "rgba(255, 255, 255, 0.72)";
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
 function drawClipExportFrame(
   resources: ExportCanvasResources,
   clip: ClipItem,
   progress: number,
   simulatedTime: number
 ) {
-  const { canvas, ctx, img, imgCrop, splitBgImg, sourceVideo } = resources;
+  const {
+    canvas,
+    ctx,
+    img,
+    imgCrop,
+    sceneFrames,
+    splitBgImg,
+    sourceVideo,
+    audioEnvelope,
+    captionTimeScale,
+  } = resources;
   const scaleFactor = Math.min(canvas.width, canvas.height) / 540;
 
   ctx.fillStyle = "#09090B";
@@ -735,36 +1443,65 @@ function drawClipExportFrame(
   ctx.rect(0, 0, canvas.width, primaryRegionH);
   ctx.clip();
 
-  if (sourceVideo && sourceVideo.videoWidth > 0 && sourceVideo.readyState >= 2) {
-    const scale =
-      Math.max(
-        canvas.width / sourceVideo.videoWidth,
-        primaryRegionH / sourceVideo.videoHeight
-      ) * clip.zoomScale;
-    const drawW = sourceVideo.videoWidth * scale;
-    const drawH = sourceVideo.videoHeight * scale;
-    const overflowX = Math.max(0, drawW - canvas.width);
-    const offsetX = -(overflowX * (clip.focalPointX / 100));
-    const offsetY = (primaryRegionH - drawH) / 2;
-    ctx.drawImage(sourceVideo, offsetX, offsetY, drawW, drawH);
-  } else if (img && img.naturalWidth > 0) {
-    const sx = imgCrop ? imgCrop.sx : 0;
-    const sy = imgCrop ? imgCrop.sy : 0;
-    const sw = imgCrop ? imgCrop.sw : img.naturalWidth;
-    const sh = imgCrop ? imgCrop.sh : img.naturalHeight;
+  if (sourceVideo && sourceVideo.videoWidth > 0) {
+    try {
+      const scale =
+        Math.max(
+          canvas.width / sourceVideo.videoWidth,
+          primaryRegionH / sourceVideo.videoHeight
+        ) * clip.zoomScale;
+      const drawW = sourceVideo.videoWidth * scale;
+      const drawH = sourceVideo.videoHeight * scale;
+      const overflowX = Math.max(0, drawW - canvas.width);
+      const offsetX = -(overflowX * (clip.focalPointX / 100));
+      const offsetY = (primaryRegionH - drawH) / 2;
+      ctx.drawImage(sourceVideo, offsetX, offsetY, drawW, drawH);
+    } catch {
+      // Ignore single-frame video draw error
+    }
+  } else if (sceneFrames.length > 0) {
+    const totalScenes = Math.max(sceneFrames.length, 4);
+    const sceneFloat = progress * totalScenes;
+    const currentSceneSlot = Math.min(totalScenes - 1, Math.floor(sceneFloat));
+    const sceneLocalProgress = sceneFloat - currentSceneSlot;
+    const currentFrame = sceneFrames[currentSceneSlot % sceneFrames.length];
 
-    // Smooth Ken Burns zoom + horizontal pan across the clean cropped image
-    const motionZoom = 1.04 + Math.sin(progress * Math.PI) * 0.08;
-    const scale =
-      Math.max(canvas.width / sw, primaryRegionH / sh) * clip.zoomScale * motionZoom;
-    const drawW = sw * scale;
-    const drawH = sh * scale;
-    const overflowX = Math.max(0, drawW - canvas.width);
-    const panShift = Math.sin(progress * Math.PI * 2) * 0.1;
-    const clampedFocal = Math.min(100, Math.max(0, clip.focalPointX + panShift * 100));
-    const offsetX = -(overflowX * (clampedFocal / 100));
-    const offsetY = (primaryRegionH - drawH) / 2;
-    ctx.drawImage(img, sx, sy, sw, sh, offsetX, offsetY, drawW, drawH);
+    drawSceneImageFrame(
+      ctx,
+      canvas.width,
+      primaryRegionH,
+      clip,
+      currentFrame,
+      sceneLocalProgress,
+      currentSceneSlot,
+      1
+    );
+
+    if (sceneFrames.length > 1 && sceneLocalProgress > 0.82 && currentSceneSlot < totalScenes - 1) {
+      const fadeAlpha = Math.min(1, (sceneLocalProgress - 0.82) / 0.18);
+      const nextFrame = sceneFrames[(currentSceneSlot + 1) % sceneFrames.length];
+      drawSceneImageFrame(
+        ctx,
+        canvas.width,
+        primaryRegionH,
+        clip,
+        nextFrame,
+        0,
+        currentSceneSlot + 1,
+        fadeAlpha
+      );
+    }
+  } else if (img && img.naturalWidth > 0) {
+    drawSceneImageFrame(
+      ctx,
+      canvas.width,
+      primaryRegionH,
+      clip,
+      { img, crop: imgCrop },
+      progress,
+      0,
+      1
+    );
   }
   ctx.restore();
 
@@ -798,11 +1535,28 @@ function drawClipExportFrame(
   ctx.fillStyle = scrimGrad;
   ctx.fillRect(0, 0, canvas.width, canvas.height);
 
+  // Subtle top timeline progress indicator
+  ctx.fillStyle = "rgba(255, 255, 255, 0.16)";
+  ctx.fillRect(0, 0, canvas.width, Math.max(3, Math.round(3 * scaleFactor)));
+  ctx.fillStyle = "#3B82F6";
+  ctx.fillRect(
+    0,
+    0,
+    Math.round(canvas.width * Math.min(1, Math.max(0, progress))),
+    Math.max(3, Math.round(3 * scaleFactor))
+  );
+
+  // When rendering multi-scene fallback with Gemini TTS voiceover, show live audio bars
+  if (!sourceVideo && audioEnvelope) {
+    drawVoiceoverWaveform(ctx, canvas, audioEnvelope, progress, isSplitScreen, scaleFactor);
+  }
+
   if (clip.showAutoHook && clip.hookTitle) {
     drawAutoHookOverlay(ctx, canvas, clip.hookTitle, scaleFactor);
   }
 
-  drawStyledCaptionsOverlay(ctx, canvas, clip, simulatedTime, isSplitScreen, scaleFactor);
+  const syncedCaptionTime = captionTimeScale !== 1 ? simulatedTime / captionTimeScale : simulatedTime;
+  drawStyledCaptionsOverlay(ctx, canvas, clip, syncedCaptionTime, isSplitScreen, scaleFactor);
 }
 
 async function seekVideoTo(vid: HTMLVideoElement, timeSec: number): Promise<void> {
@@ -811,19 +1565,50 @@ async function seekVideoTo(vid: HTMLVideoElement, timeSec: number): Promise<void
   }
   await new Promise<void>((resolve) => {
     let settled = false;
-    const done = () => {
+    let seekDone = false;
+    let pollTimer = 0;
+
+    const finish = () => {
       if (settled) return;
       settled = true;
-      window.clearTimeout(timer);
-      vid.removeEventListener("seeked", done);
+      window.clearTimeout(safetyTimer);
+      window.clearInterval(pollTimer);
+      vid.removeEventListener("seeked", onSeeked);
+      vid.removeEventListener("canplay", onCanPlay);
       resolve();
     };
-    const timer = window.setTimeout(done, 450);
-    vid.addEventListener("seeked", done, { once: true });
+
+    const tryFinish = () => {
+      if (seekDone && vid.readyState >= 2) {
+        if (typeof window.requestAnimationFrame === "function") {
+          window.requestAnimationFrame(() => finish());
+        } else {
+          finish();
+        }
+      }
+    };
+
+    const onSeeked = () => {
+      seekDone = true;
+      tryFinish();
+      if (!settled && !pollTimer) {
+        pollTimer = window.setInterval(() => {
+          if (vid.readyState >= 2) tryFinish();
+        }, 20);
+      }
+    };
+
+    const onCanPlay = () => {
+      tryFinish();
+    };
+
+    const safetyTimer = window.setTimeout(finish, 1200);
+    vid.addEventListener("seeked", onSeeked);
+    vid.addEventListener("canplay", onCanPlay);
     try {
       vid.currentTime = timeSec;
     } catch {
-      done();
+      finish();
     }
   });
 }
@@ -831,14 +1616,20 @@ async function seekVideoTo(vid: HTMLVideoElement, timeSec: number): Promise<void
 async function extractClipAudioSegment(
   videoSourceUrl: string | null,
   startSec: number,
-  durationSec: number
-): Promise<{ audioBuffer: AudioBuffer; startSample: number; endSample: number } | null> {
-  if (!videoSourceUrl || typeof AudioContext === "undefined") return null;
+  durationSec: number,
+  preFetchedBlob?: Blob | null
+): Promise<AudioSegmentSlice | null> {
+  if ((!videoSourceUrl && !preFetchedBlob) || typeof AudioContext === "undefined") return null;
   let audioCtx: AudioContext | null = null;
   try {
-    const res = await fetch(videoSourceUrl);
-    if (!res.ok) return null;
-    const rawBuf = await res.arrayBuffer();
+    let rawBuf: ArrayBuffer;
+    if (preFetchedBlob) {
+      rawBuf = await preFetchedBlob.arrayBuffer();
+    } else {
+      const res = await fetch(videoSourceUrl!);
+      if (!res.ok) return null;
+      rawBuf = await res.arrayBuffer();
+    }
     audioCtx = new AudioContext();
     const audioBuffer = await audioCtx.decodeAudioData(rawBuf);
     if (audioBuffer.numberOfChannels === 0 || audioBuffer.length === 0) {
@@ -867,10 +1658,15 @@ async function recordCanvasWithMediaRecorder(
   candidateMimes: string[],
   fallbackMime: string,
   errorLabel: string,
-  onProgress?: (pct: number) => void,
-  maxRenderSec = 65
+  onProgress?: ExportProgressCallback
 ): Promise<Blob> {
-  const { canvas, sourceVideo, cleanupSourceVideo } = resources;
+  const {
+    canvas,
+    sourceVideo,
+    audioSegment,
+    effectiveRenderDurationSec,
+    cleanupSourceVideo,
+  } = resources;
 
   if (typeof MediaRecorder === "undefined" || typeof canvas.captureStream !== "function") {
     cleanupSourceVideo();
@@ -888,13 +1684,43 @@ async function recordCanvasWithMediaRecorder(
   const canvasStream = canvas.captureStream(24);
   const tracks: MediaStreamTrack[] = [...canvasStream.getVideoTracks()];
   let audioCtx: AudioContext | null = null;
+  let voiceSourceNode: AudioBufferSourceNode | null = null;
 
-  if (sourceVideo && typeof AudioContext !== "undefined") {
+  // Prefer streaming pre-decoded AudioBuffer (from source video or AI voiceover) so sourceVideo
+  // can remain muted and never gets blocked by browser async autoplay policies.
+  if (audioSegment && typeof AudioContext !== "undefined") {
+    try {
+      audioCtx = new AudioContext();
+      if (audioCtx.state === "suspended") {
+        await audioCtx.resume().catch(() => {});
+      }
+      const { audioBuffer, startSample, endSample } = audioSegment;
+      const frameLen = Math.max(1, endSample - startSample);
+      const sliced = audioCtx.createBuffer(
+        audioBuffer.numberOfChannels,
+        frameLen,
+        audioBuffer.sampleRate
+      );
+      for (let ch = 0; ch < audioBuffer.numberOfChannels; ch++) {
+        sliced.getChannelData(ch).set(audioBuffer.getChannelData(ch).subarray(startSample, endSample));
+      }
+      voiceSourceNode = audioCtx.createBufferSource();
+      voiceSourceNode.buffer = sliced;
+      const destNode = audioCtx.createMediaStreamDestination();
+      voiceSourceNode.connect(destNode);
+      tracks.push(...destNode.stream.getAudioTracks());
+    } catch {
+      if (audioCtx) {
+        audioCtx.close().catch(() => {});
+        audioCtx = null;
+      }
+      voiceSourceNode = null;
+    }
+  } else if (sourceVideo && typeof AudioContext !== "undefined") {
     try {
       audioCtx = new AudioContext();
       const sourceNode = audioCtx.createMediaElementSource(sourceVideo);
       const destNode = audioCtx.createMediaStreamDestination();
-      // Route ONLY to MediaStreamDestination (not speakers) so export stays silent
       sourceNode.connect(destNode);
       sourceVideo.muted = false;
       tracks.push(...destNode.stream.getAudioTracks());
@@ -917,17 +1743,28 @@ async function recordCanvasWithMediaRecorder(
     if (e.data && e.data.size > 0) chunks.push(e.data);
   };
 
-  const renderDurationSec = resolveFullClipDurationSec(clip, maxRenderSec);
+  const renderDurationSec = effectiveRenderDurationSec;
   const fps = 24;
   const totalFrames = Math.round(renderDurationSec * fps);
 
   if (sourceVideo) {
+    if (voiceSourceNode) {
+      sourceVideo.muted = true;
+    }
     await sourceVideo.play().catch(() => {});
   }
 
   const cleanupMedia = () => {
     cleanupSourceVideo();
     combinedStream.getTracks().forEach((t) => t.stop());
+    if (voiceSourceNode) {
+      try {
+        voiceSourceNode.stop();
+      } catch {
+        // Ignore already stopped
+      }
+      voiceSourceNode = null;
+    }
     if (audioCtx) {
       audioCtx.close().catch(() => {});
       audioCtx = null;
@@ -965,6 +1802,14 @@ async function recordCanvasWithMediaRecorder(
     };
 
     recorder.start(250);
+    if (voiceSourceNode) {
+      try {
+        voiceSourceNode.start();
+      } catch {
+        // Ignore start failure
+      }
+    }
+
     let frame = 0;
 
     const drawFrame = () => {
@@ -979,7 +1824,7 @@ async function recordCanvasWithMediaRecorder(
 
       const progress = frame / totalFrames;
       const simulatedTime = progress * renderDurationSec;
-      if (onProgress) onProgress(12 + Math.round(progress * 88));
+      onProgress?.(12 + Math.round(progress * 86), "Encoding video...");
 
       drawClipExportFrame(resources, clip, progress, simulatedTime);
 
@@ -998,7 +1843,7 @@ async function recordCanvasWithMediaRecorder(
 export async function renderWebmClipBlob(
   clip: ClipItem,
   project: VideoProject,
-  onProgress?: (pct: number) => void,
+  onProgress?: ExportProgressCallback,
   maxRenderSec = 65
 ): Promise<Blob> {
   const renderDurationSec = resolveFullClipDurationSec(clip, maxRenderSec);
@@ -1006,7 +1851,8 @@ export async function renderWebmClipBlob(
     clip,
     project,
     renderDurationSec,
-    onProgress
+    onProgress,
+    { includeAudio: true, maxRenderSec, allowSceneFallback: false }
   );
   return recordCanvasWithMediaRecorder(
     resources,
@@ -1014,47 +1860,135 @@ export async function renderWebmClipBlob(
     ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"],
     "video/webm",
     "WebM video",
-    onProgress,
-    maxRenderSec
+    onProgress
   );
 }
 
 /**
- * Renders a genuine HD H.264 MP4 Blob (+ AAC audio when source media has audio)
+ * Probes WebCodecs AudioEncoder support (trying AAC first, then 48kHz Opus fallback)
+ * and resamples the audio slice when required.
+ */
+async function prepareMuxableAudioTrack(segment: AudioSegmentSlice): Promise<{
+  muxerCodec: "aac" | "opus";
+  encoderConfig: AudioEncoderConfig;
+  segment: AudioSegmentSlice;
+} | null> {
+  if (typeof AudioEncoder === "undefined" || typeof AudioData === "undefined") {
+    return null;
+  }
+
+  const nativeChannels = Math.min(2, segment.audioBuffer.numberOfChannels);
+  const channelOptions = nativeChannels === 1 ? [1, 2] : [2, 1];
+  const aacSampleRates = Array.from(
+    new Set([segment.audioBuffer.sampleRate, 48000, 44100])
+  );
+
+  for (const chCount of channelOptions) {
+    for (const sr of aacSampleRates) {
+      const candidate: AudioEncoderConfig = {
+        codec: "mp4a.40.2",
+        sampleRate: sr,
+        numberOfChannels: chCount,
+        bitrate: 128_000,
+      };
+      try {
+        const support = await AudioEncoder.isConfigSupported(candidate);
+        if (support.supported) {
+          const finalConfig = support.config || candidate;
+          const targetSr = finalConfig.sampleRate || sr;
+          const targetCh = finalConfig.numberOfChannels || chCount;
+          const preparedSegment = await resampleAudioSegment(segment, targetSr, targetCh);
+          return {
+            muxerCodec: "aac",
+            encoderConfig: finalConfig,
+            segment: preparedSegment,
+          };
+        }
+      } catch {
+        // Probe next AAC profile
+      }
+    }
+  }
+
+  // Fallback to Opus (48kHz) when browser lacks proprietary AAC encoder
+  for (const chCount of channelOptions) {
+    const opusCandidate: AudioEncoderConfig = {
+      codec: "opus",
+      sampleRate: 48000,
+      numberOfChannels: chCount,
+      bitrate: 128_000,
+    };
+    try {
+      const support = await AudioEncoder.isConfigSupported(opusCandidate);
+      if (support.supported) {
+        const finalConfig = support.config || opusCandidate;
+        const targetSr = finalConfig.sampleRate || 48000;
+        const targetCh = finalConfig.numberOfChannels || chCount;
+        const preparedSegment = await resampleAudioSegment(segment, targetSr, targetCh);
+        return {
+          muxerCodec: "opus",
+          encoderConfig: finalConfig,
+          segment: preparedSegment,
+        };
+      }
+    } catch {
+      // Probe next channel count
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Renders a genuine HD H.264 MP4 Blob (+ AAC/Opus audio from source video or AI voiceover)
  * using WebCodecs + mp4-muxer, falling back to native MP4 MediaRecorder when available.
  */
 export async function renderMp4ClipBlob(
   clip: ClipItem,
   project: VideoProject,
-  onProgress?: (pct: number) => void,
+  onProgress?: ExportProgressCallback,
   maxRenderSec = 65
 ): Promise<Blob> {
-  const renderDurationSec = resolveFullClipDurationSec(clip, maxRenderSec);
+  const initialDurationSec = resolveFullClipDurationSec(clip, maxRenderSec);
   const resources = await prepareExportCanvasResources(
     clip,
     project,
-    renderDurationSec,
-    onProgress
+    initialDurationSec,
+    onProgress,
+    { includeAudio: true, maxRenderSec, allowSceneFallback: false }
   );
+  return encodePreparedMp4Resources(resources, clip, onProgress);
+}
+
+async function encodePreparedMp4Resources(
+  resources: ExportCanvasResources,
+  clip: ClipItem,
+  onProgress?: ExportProgressCallback
+): Promise<Blob> {
   const {
     canvas,
     sourceVideo,
-    videoSourceUrl,
     videoDurationSec,
     isPreCutSegment,
+    audioSegment: rawAudioSegment,
+    effectiveRenderDurationSec: renderDurationSec,
     cleanupSourceVideo,
   } = resources;
   const fps = 24;
   const totalFrames = Math.round(renderDurationSec * fps);
 
-  // Path A: WebCodecs VideoEncoder (+ optional AudioEncoder) + mp4-muxer
+  // Path A: WebCodecs VideoEncoder (+ AudioEncoder) + mp4-muxer
   if (typeof VideoEncoder !== "undefined" && typeof VideoFrame !== "undefined") {
+    // Prefer Constrained Baseline profiles with realtime latencyMode so WebCodecs
+    // never emits B-frames with out-of-order PTS/DTS into mp4-muxer.
     const h264Candidates = [
-      "avc1.640028",
-      "avc1.4d002a",
+      "avc1.42E01F",
+      "avc1.42E028",
       "avc1.42E01E",
       "avc1.42001f",
-      "avc1.42001e",
+      "avc1.4d0020",
+      "avc1.4d001f",
+      "avc1.640028",
     ];
     let selectedVideoConfig: VideoEncoderConfig | null = null;
 
@@ -1066,10 +2000,14 @@ export async function renderMp4ClipBlob(
           height: canvas.height,
           bitrate: 4_000_000,
           framerate: fps,
+          latencyMode: "realtime",
         };
         const support = await VideoEncoder.isConfigSupported(candidate);
         if (support.supported) {
-          selectedVideoConfig = support.config || candidate;
+          selectedVideoConfig = {
+            ...(support.config || candidate),
+            latencyMode: "realtime",
+          };
           break;
         }
       } catch {
@@ -1084,34 +2022,15 @@ export async function renderMp4ClipBlob(
         ? Math.min(Math.max(0, clip.startTimeSec), Math.max(0, videoDurationSec - 2))
         : 0;
 
-      // Prepare AAC audio track if source video has audio and AudioEncoder supports AAC
-      let audioSegment: { audioBuffer: AudioBuffer; startSample: number; endSample: number } | null =
-        null;
-      let audioConfig: AudioEncoderConfig | null = null;
+      const preparedAudio = rawAudioSegment
+        ? await prepareMuxableAudioTrack(rawAudioSegment)
+        : null;
 
-      if (sourceVideo && videoSourceUrl && typeof AudioEncoder !== "undefined" && typeof AudioData !== "undefined") {
-        audioSegment = await extractClipAudioSegment(
-          videoSourceUrl,
-          targetStart,
-          renderDurationSec
+      if (rawAudioSegment && !preparedAudio) {
+        cleanupSourceVideo();
+        throw new Error(
+          "Your browser WebCodecs AudioEncoder does not support AAC or Opus encoding for MP4 export."
         );
-        if (audioSegment) {
-          const channels = Math.min(2, audioSegment.audioBuffer.numberOfChannels);
-          const candidateAudio: AudioEncoderConfig = {
-            codec: "mp4a.40.2",
-            sampleRate: audioSegment.audioBuffer.sampleRate,
-            numberOfChannels: channels,
-            bitrate: 128_000,
-          };
-          try {
-            const support = await AudioEncoder.isConfigSupported(candidateAudio);
-            if (support.supported) {
-              audioConfig = support.config || candidateAudio;
-            }
-          } catch {
-            audioConfig = null;
-          }
-        }
       }
 
       const target = new ArrayBufferTarget();
@@ -1123,12 +2042,12 @@ export async function renderMp4ClipBlob(
           height: canvas.height,
           frameRate: fps,
         },
-        ...(audioConfig
+        ...(preparedAudio
           ? {
               audio: {
-                codec: "aac",
-                numberOfChannels: audioConfig.numberOfChannels,
-                sampleRate: audioConfig.sampleRate,
+                codec: preparedAudio.muxerCodec,
+                numberOfChannels: preparedAudio.encoderConfig.numberOfChannels,
+                sampleRate: preparedAudio.encoderConfig.sampleRate,
               },
             }
           : {}),
@@ -1146,7 +2065,7 @@ export async function renderMp4ClipBlob(
       });
 
       let audioEncoder: AudioEncoder | null = null;
-      if (audioConfig) {
+      if (preparedAudio) {
         audioEncoder = new AudioEncoder({
           output: (chunk, meta) => {
             muxer.addAudioChunk(chunk, meta);
@@ -1159,11 +2078,13 @@ export async function renderMp4ClipBlob(
 
       try {
         videoEncoder.configure(selectedVideoConfig);
-        if (audioEncoder && audioConfig) {
-          audioEncoder.configure(audioConfig);
+        if (audioEncoder && preparedAudio) {
+          audioEncoder.configure(preparedAudio.encoderConfig);
         }
 
         const frameDurationUs = Math.round(1_000_000 / fps);
+        const motionHashes = new Set<string>();
+        const sampleStride = Math.max(1, Math.floor(totalFrames / 12));
 
         // Encode video frames deterministically (frame-accurate seek when sourceVideo exists)
         for (let frame = 0; frame < totalFrames; frame++) {
@@ -1172,7 +2093,7 @@ export async function renderMp4ClipBlob(
           const progress = frame / totalFrames;
           const simulatedTime = progress * renderDurationSec;
           const pctSpan = audioEncoder ? 76 : 84;
-          if (onProgress) onProgress(12 + Math.round(progress * pctSpan));
+          onProgress?.(12 + Math.round(progress * pctSpan), "Encoding video...");
 
           if (sourceVideo) {
             const maxVidTime = videoDurationSec > 0.1 ? videoDurationSec - 0.05 : targetStart + simulatedTime;
@@ -1181,6 +2102,11 @@ export async function renderMp4ClipBlob(
           }
 
           drawClipExportFrame(resources, clip, progress, simulatedTime);
+
+          if (frame % sampleStride === 0 || frame === totalFrames - 1) {
+            const sig = sampleCanvasFrameSignature(canvas);
+            if (sig) motionHashes.add(sig);
+          }
 
           const timestampUs = Math.round(frame * frameDurationUs);
           const vf = new VideoFrame(canvas, {
@@ -1203,13 +2129,20 @@ export async function renderMp4ClipBlob(
           }
         }
 
+        if (totalFrames >= fps * 2 && motionHashes.size < 2) {
+          throw new Error(
+            "Export aborted: video frames appeared frozen on a single static frame. Please retry or attach a standard H.264 MP4."
+          );
+        }
+
         // Encode audio slice when available
-        if (audioEncoder && audioConfig && audioSegment) {
-          const { audioBuffer, startSample, endSample } = audioSegment;
-          const channels = audioConfig.numberOfChannels;
+        if (audioEncoder && preparedAudio) {
+          onProgress?.(88, "Encoding audio...");
+          const { audioBuffer, startSample, endSample } = preparedAudio.segment;
+          const channels = preparedAudio.encoderConfig.numberOfChannels;
           const sampleRate = audioBuffer.sampleRate;
           const totalAudioSamples = endSample - startSample;
-          const chunkFrames = 1024;
+          const chunkFrames = preparedAudio.muxerCodec === "opus" ? 960 : 1024;
           let offset = 0;
 
           while (offset < totalAudioSamples) {
@@ -1219,7 +2152,9 @@ export async function renderMp4ClipBlob(
             const planar = new Float32Array(planarBuffer);
 
             for (let ch = 0; ch < channels; ch++) {
-              const chData = audioBuffer.getChannelData(ch);
+              const chData = audioBuffer.getChannelData(
+                Math.min(ch, Math.max(0, audioBuffer.numberOfChannels - 1))
+              );
               const slice = chData.subarray(
                 startSample + offset,
                 startSample + offset + framesNow
@@ -1243,22 +2178,26 @@ export async function renderMp4ClipBlob(
             }
 
             offset += framesNow;
-            if (onProgress) {
-              onProgress(88 + Math.round((offset / totalAudioSamples) * 8));
-            }
+            onProgress?.(
+              88 + Math.round((offset / totalAudioSamples) * 8),
+              "Encoding audio..."
+            );
           }
           await audioEncoder.flush();
         }
 
         await videoEncoder.flush();
         if (encoderError) throw encoderError;
+        onProgress?.(97, "Finalizing MP4...");
         muxer.finalize();
-        if (onProgress) onProgress(100);
 
         const mp4Blob = new Blob([target.buffer], { type: "video/mp4" });
-        if (mp4Blob.size === 0) {
-          throw new Error("Rendered MP4 file was empty.");
-        }
+        onProgress?.(98, "Validating export...");
+        await validateExportedMp4Blob(mp4Blob, {
+          requireAudio: Boolean(preparedAudio),
+          minDurationSec: renderDurationSec,
+        });
+        onProgress?.(100, "Export ready");
         return mp4Blob;
       } finally {
         if (videoEncoder.state !== "closed") {
@@ -1287,52 +2226,236 @@ export async function renderMp4ClipBlob(
     mp4Mimes.some((m) => MediaRecorder.isTypeSupported(m));
 
   if (hasNativeMp4Recorder) {
-    return recordCanvasWithMediaRecorder(
+    const recBlob = await recordCanvasWithMediaRecorder(
       resources,
       clip,
       mp4Mimes,
       "",
       "MP4 (H.264)",
-      onProgress,
-      maxRenderSec
+      onProgress
     );
+    onProgress?.(98, "Validating export...");
+    await validateExportedMp4Blob(recBlob, {
+      requireAudio: Boolean(rawAudioSegment),
+      minDurationSec: renderDurationSec,
+    });
+    onProgress?.(100, "Export ready");
+    return recBlob;
   }
 
   cleanupSourceVideo();
   throw new Error(
-    "MP4 (H.264) export is not supported in this browser. Please use Video (.webm) or open in Chrome, Edge, or Safari."
+    "MP4 (H.264) export is not supported in this browser. Please open in Chrome, Edge, or Safari."
   );
+}
+
+export interface ExportDownloadSummary {
+  usedSourceVideo: boolean;
+  usedAudio: boolean;
+  clipSourceError: string | null;
+  voiceoverError: string | null;
+}
+
+async function renderMp4ClipWithSummary(
+  clip: ClipItem,
+  project: VideoProject,
+  onProgress?: ExportProgressCallback,
+  maxRenderSec = 65
+): Promise<{ blob: Blob; summary: ExportDownloadSummary }> {
+  const initialDurationSec = resolveFullClipDurationSec(clip, maxRenderSec);
+  const resources = await prepareExportCanvasResources(
+    clip,
+    project,
+    initialDurationSec,
+    onProgress,
+    { includeAudio: true, maxRenderSec, allowSceneFallback: false }
+  );
+  const usedSourceVideo = Boolean(resources.sourceVideo);
+  const usedAudio = Boolean(resources.audioSegment);
+  const clipSourceError = resources.clipSourceError;
+  const voiceoverError = resources.voiceoverError;
+
+  const blob = await encodePreparedMp4Resources(resources, clip, onProgress);
+  return {
+    blob,
+    summary: { usedSourceVideo, usedAudio, clipSourceError, voiceoverError },
+  };
 }
 
 export async function renderAndDownloadWebmClip(
   clip: ClipItem,
   project: VideoProject,
-  onProgress?: (pct: number) => void
-): Promise<void> {
-  const blob = await renderWebmClipBlob(clip, project, onProgress, 65);
+  onProgress?: ExportProgressCallback
+): Promise<ExportDownloadSummary> {
+  const maxRenderSec = 65;
+  const renderDurationSec = resolveFullClipDurationSec(clip, maxRenderSec);
+  const resources = await prepareExportCanvasResources(
+    clip,
+    project,
+    renderDurationSec,
+    onProgress,
+    { includeAudio: true, maxRenderSec, allowSceneFallback: false }
+  );
+  const usedSourceVideo = Boolean(resources.sourceVideo);
+  const usedAudio = Boolean(resources.audioSegment);
+  const clipSourceError = resources.clipSourceError;
+  const voiceoverError = resources.voiceoverError;
+  const blob = await recordCanvasWithMediaRecorder(
+    resources,
+    clip,
+    ["video/webm;codecs=vp9,opus", "video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"],
+    "video/webm",
+    "WebM video",
+    onProgress
+  );
   triggerDownload(
     blob,
-    `${slugify(clip.title)}-${clip.aspectRatio.replace(":", "x")}.webm`
+    `AI_Video_Clip_Generator_${slugify(clip.title)}-${clip.aspectRatio.replace(":", "x")}.webm`
   );
+  return { usedSourceVideo, usedAudio, clipSourceError, voiceoverError };
 }
 
 export async function renderAndDownloadMp4Clip(
   clip: ClipItem,
   project: VideoProject,
-  onProgress?: (pct: number) => void
-): Promise<void> {
-  const blob = await renderMp4ClipBlob(clip, project, onProgress, 65);
+  onProgress?: ExportProgressCallback
+): Promise<ExportDownloadSummary> {
+  const { blob, summary } = await renderMp4ClipWithSummary(clip, project, onProgress, 65);
   triggerDownload(
     blob,
-    `${slugify(clip.title)}-${clip.aspectRatio.replace(":", "x")}.mp4`
+    `AI_Video_Clip_Generator_${slugify(clip.title)}-${clip.aspectRatio.replace(":", "x")}.mp4`
   );
+  return summary;
+}
+
+export async function renderAndDownloadOriginalCutMp4(
+  clip: ClipItem,
+  project: VideoProject,
+  onProgress?: ExportProgressCallback
+): Promise<{ hasAudioTrack: boolean }> {
+  const startSec = Math.max(0, Number(clip.startTimeSec) || 0);
+  const rawDur =
+    Number(clip.durationSec) ||
+    Math.max(0, (Number(clip.endTimeSec) || 0) - startSec) ||
+    30;
+  const durSec = Math.min(Math.max(2, Math.ceil(rawDur)), 120);
+  const outFilename = `AI_Video_Clip_Generator_${slugify(clip.title)}-original.mp4`;
+
+  onProgress?.(10, "Checking video...");
+
+  if (project.localVideoUrl) {
+    const localRes = await fetch(project.localVideoUrl);
+    if (!localRes.ok) {
+      throw new Error("Could not read attached local video file.");
+    }
+    const localBlob = await localRes.blob();
+    if (localBlob.size <= 200 * 1024 * 1024) {
+      onProgress?.(35, "Trimming video...");
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 90000);
+      try {
+        const trimRes = await fetch(
+          apiUrl(`/api/video/trim-local?start=${startSec.toFixed(2)}&duration=${durSec}`),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/octet-stream" },
+            body: localBlob,
+            signal: controller.signal,
+          }
+        );
+        window.clearTimeout(timer);
+        if (trimRes.ok) {
+          onProgress?.(85, "Validating MP4...");
+          const cutBlob = await trimRes.blob();
+          const inspection = await validateExportedMp4Blob(cutBlob, {
+            requireAudio: false,
+            minDurationSec: Math.min(durSec, 2),
+          });
+          onProgress?.(100, "Export ready");
+          triggerDownload(cutBlob, outFilename);
+          return { hasAudioTrack: inspection.hasAudioTrack };
+        } else {
+          const errJson = await trimRes.json().catch(() => null);
+          throw new Error(errJson?.error || "Server could not trim the uploaded video.");
+        }
+      } catch (err) {
+        window.clearTimeout(timer);
+        if (err instanceof Error && err.name === "AbortError") {
+          throw new Error("Timed out while trimming the original video file.");
+        }
+        throw err;
+      }
+    }
+    throw new Error(
+      "Video file is larger than 200MB for direct server cut; use Captioned Video (.mp4) export instead."
+    );
+  }
+
+  const isSyntheticDemoUrl =
+    Boolean(project.isDemo) &&
+    !project.youtubeId &&
+    (!project.url || /watch\?v=demo_/i.test(project.url));
+
+  if (isSyntheticDemoUrl || (!project.youtubeId && !project.url)) {
+    throw new Error(
+      "This demo clip has no downloadable original video stream. Click 'Attach original MP4' below to cut & download from a real video file."
+    );
+  }
+
+  const remoteTarget = project.youtubeId
+    ? `https://www.youtube.com/watch?v=${project.youtubeId}`
+    : project.url!;
+
+  onProgress?.(25, "Extracting clip...");
+  const controller = new AbortController();
+  const fetchTimer = window.setTimeout(() => controller.abort(), 75000);
+  try {
+    const clipSrcUrl = apiUrl(
+      `/api/video/clip-source?url=${encodeURIComponent(remoteTarget)}&start=${Math.floor(
+        startSec
+      )}&duration=${durSec}`
+    );
+    const segRes = await fetch(clipSrcUrl, { signal: controller.signal });
+    window.clearTimeout(fetchTimer);
+
+    if (!segRes.ok) {
+      const errJson = await segRes.json().catch(() => null);
+      const rawErr = errJson?.error || `Original video cut failed (${segRes.status}).`;
+      if (/not a bot|cookies|YOUTUBE_BOT_CHECK/i.test(rawErr)) {
+        throw new Error(
+          "YouTube blocked cloud server download on this video. Click 'Attach original MP4' below to cut & download all clips from your video file."
+        );
+      }
+      throw new Error(rawErr);
+    }
+
+    onProgress?.(85, "Validating MP4...");
+    const segBlob = await segRes.blob();
+    const inspection = await validateExportedMp4Blob(segBlob, {
+      requireAudio: false,
+      minDurationSec: Math.min(durSec, 2),
+    });
+    onProgress?.(100, "Export ready");
+    triggerDownload(segBlob, outFilename);
+    return { hasAudioTrack: inspection.hasAudioTrack };
+  } catch (err) {
+    window.clearTimeout(fetchTimer);
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error("Timed out extracting original video segment.");
+    }
+    throw err;
+  }
 }
 
 export async function downloadCoverPng(
   clip: ClipItem,
   project: VideoProject
 ): Promise<void> {
-  const resources = await prepareExportCanvasResources(clip, project, 5);
+  const resources = await prepareExportCanvasResources(clip, project, 5, undefined, {
+    includeAudio: false,
+    maxRenderSec: 5,
+    allowSceneFallback: true,
+  });
   try {
     const firstCueTime = clip.transcript[0]?.startOffsetSec ?? 0.5;
     drawClipExportFrame(resources, clip, 0.15, firstCueTime + 0.1);
@@ -1347,7 +2470,7 @@ export async function downloadCoverPng(
     });
     triggerDownload(
       pngBlob,
-      `${slugify(clip.title)}-${clip.aspectRatio.replace(":", "x")}-cover.png`
+      `AI_Video_Clip_Generator_${slugify(clip.title)}-${clip.aspectRatio.replace(":", "x")}-cover.png`
     );
   } finally {
     resources.cleanupSourceVideo();
@@ -1373,7 +2496,7 @@ function slugify(str: string): string {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-|-$/g, "")
-      .slice(0, 48) || "scalereach-clip"
+      .slice(0, 48) || "clip"
   );
 }
 
@@ -1385,5 +2508,5 @@ function triggerDownload(blob: Blob, filename: string) {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
-  setTimeout(() => URL.revokeObjectURL(url), 1500);
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
 }

@@ -213,11 +213,27 @@ function escapeHtmlText(str: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function getConfiguredGeminiApiKey(): string {
+  const candidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.GOOGLE_API_KEY,
+    process.env.GOOGLE_GENERATIVE_AI_API_KEY,
+    process.env.API_KEY,
+  ];
+  for (const raw of candidates) {
+    const cleaned = (raw || "").trim().replace(/^["']|["']$/g, "");
+    if (cleaned && cleaned !== "MY_GEMINI_API_KEY") {
+      return cleaned;
+    }
+  }
+  return "";
+}
+
 function getGeminiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = getConfiguredGeminiApiKey();
   if (!apiKey) {
     throw new Error(
-      "GEMINI_API_KEY is not configured. Please add your Gemini API key in Settings > Secrets."
+      "GEMINI_API_KEY is not configured. Please add GEMINI_API_KEY in AI Studio (Settings > Secrets) or Render (Environment > Environment Variables), then restart/redeploy."
     );
   }
   return new GoogleGenAI({
@@ -392,14 +408,15 @@ function isBlockedPrivateHost(rawHost: string): boolean {
 const CLIP_CACHE_DIR = path.join(os.tmpdir(), "scalereach-clips");
 const YTDLP_TMP_BIN = path.join(os.tmpdir(), "yt-dlp");
 let ytDlpInstallPromise: Promise<string> | null = null;
+const inFlightSourceDownloads = new Map<string, Promise<string>>();
 const inFlightClipExtractions = new Map<string, Promise<string>>();
 const probedDurationCache = new Map<string, number>();
 
 function getFfmpegExecutable(): string | null {
+  if (fs.existsSync("/usr/bin/ffmpeg")) return "/usr/bin/ffmpeg";
   if (typeof ffmpegPath === "string" && ffmpegPath && fs.existsSync(ffmpegPath)) {
     return ffmpegPath;
   }
-  if (fs.existsSync("/usr/bin/ffmpeg")) return "/usr/bin/ffmpeg";
   return null;
 }
 
@@ -437,6 +454,31 @@ async function ensureYtDlpBinary(): Promise<string> {
   return ytDlpInstallPromise;
 }
 
+const YTDLP_COOKIES_FILE = path.join(os.tmpdir(), "yt-cookies.txt");
+let lastCookiesHash = "";
+
+function getYtDlpCookieArgs(): string[] {
+  const raw = process.env.YOUTUBE_COOKIES?.trim();
+  if (!raw) return [];
+  try {
+    let decoded = raw;
+    if (!raw.includes("youtube.com") && !raw.startsWith("# Netscape")) {
+      const candidate = Buffer.from(raw, "base64").toString("utf8");
+      if (candidate.includes("youtube.com") || candidate.startsWith("# Netscape")) {
+        decoded = candidate;
+      }
+    }
+    const hash = crypto.createHash("sha256").update(decoded).digest("hex");
+    if (hash !== lastCookiesHash || !fs.existsSync(YTDLP_COOKIES_FILE)) {
+      fs.writeFileSync(YTDLP_COOKIES_FILE, decoded, { mode: 0o600 });
+      lastCookiesHash = hash;
+    }
+    return ["--cookies", YTDLP_COOKIES_FILE];
+  } catch {
+    return [];
+  }
+}
+
 async function probeVideoMetadataWithYtDlp(targetUrl: string): Promise<{
   title?: string;
   channel?: string;
@@ -454,6 +496,7 @@ async function probeVideoMetadataWithYtDlp(targetUrl: string): Promise<{
         `node:${process.execPath}`,
         "--no-warnings",
         "--no-playlist",
+        ...getYtDlpCookieArgs(),
         "--dump-single-json",
         "--skip-download",
         targetUrl,
@@ -509,6 +552,125 @@ function pruneOldClipCache() {
   }
 }
 
+const botBlockedUntilCache = new Map<string, number>();
+
+async function ensureDownloadedSourceVideo(targetUrl: string): Promise<string> {
+  const urlHash = crypto.createHash("sha256").update(targetUrl).digest("hex").slice(0, 20);
+  const existingSource = fs
+    .readdirSync(CLIP_CACHE_DIR)
+    .find((f) => f.startsWith(`source-${urlHash}.`) && /\.(mp4|webm|mkv|mov|m4v)$/i.test(f));
+
+  if (existingSource) {
+    const fullExisting = path.join(CLIP_CACHE_DIR, existingSource);
+    try {
+      if (fs.statSync(fullExisting).size > 20_000) {
+        return fullExisting;
+      }
+    } catch {
+      // Fall through to re-download
+    }
+  }
+
+  const inFlight = inFlightSourceDownloads.get(urlHash);
+  if (inFlight) return inFlight;
+
+  const downloadTask = (async () => {
+    const ytDlp = await ensureYtDlpBinary();
+    const ffmpegBin = getFfmpegExecutable();
+    const tmpPrefix = `srcdl-${urlHash}-${crypto.randomBytes(4).toString("hex")}`;
+    const tmpTemplate = path.join(CLIP_CACHE_DIR, `${tmpPrefix}.%(ext)s`);
+
+    const baseArgs = [
+      "--js-runtimes",
+      `node:${process.execPath}`,
+      "--no-warnings",
+      "--no-playlist",
+      "--max-filesize",
+      "350M",
+      ...getYtDlpCookieArgs(),
+    ];
+
+    try {
+      // Prefer progressive MP4 (combined video+audio) so yt-dlp downloads cleanly without invoking ffmpeg over HTTPS.
+      try {
+        await execFileAsync(
+          ytDlp,
+          [
+            ...baseArgs,
+            "-f",
+            "best[height<=720][ext=mp4][vcodec!=none][acodec!=none]/18/best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]/best",
+            "-o",
+            tmpTemplate,
+            targetUrl,
+          ],
+          { timeout: 65000, maxBuffer: 10 * 1024 * 1024 }
+        );
+      } catch (primaryErr) {
+        const msg = parseReadableError(primaryErr);
+        if (/not a bot|cookies/i.test(msg)) {
+          throw primaryErr;
+        }
+        // Fallback to separate video+audio merged locally with ffmpeg
+        await execFileAsync(
+          ytDlp,
+          [
+            ...baseArgs,
+            ...(ffmpegBin ? ["--ffmpeg-location", ffmpegBin] : []),
+            "-f",
+            "bestvideo[height<=720]+bestaudio/best",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            tmpTemplate,
+            targetUrl,
+          ],
+          { timeout: 65000, maxBuffer: 10 * 1024 * 1024 }
+        );
+      }
+
+      const downloaded = fs
+        .readdirSync(CLIP_CACHE_DIR)
+        .find((f) => f.startsWith(`${tmpPrefix}.`) && /\.(mp4|webm|mkv|mov|m4v)$/i.test(f));
+
+      if (!downloaded) {
+        throw new Error("Source video download produced no output.");
+      }
+
+      const downloadedPath = path.join(CLIP_CACHE_DIR, downloaded);
+      if (fs.statSync(downloadedPath).size < 20_000) {
+        fs.unlinkSync(downloadedPath);
+        throw new Error("Downloaded source video was empty.");
+      }
+
+      const ext = path.extname(downloaded) || ".mp4";
+      const cachedSourcePath = path.join(CLIP_CACHE_DIR, `source-${urlHash}${ext}`);
+      fs.renameSync(downloadedPath, cachedSourcePath);
+      return cachedSourcePath;
+    } catch (err) {
+      const msg = parseReadableError(err);
+      if (/not a bot|cookies/i.test(msg)) {
+        botBlockedUntilCache.set(targetUrl, Date.now() + 2 * 60 * 1000);
+      }
+      throw err;
+    } finally {
+      try {
+        for (const f of fs.readdirSync(CLIP_CACHE_DIR)) {
+          if (f.startsWith(`${tmpPrefix}.`)) {
+            fs.unlinkSync(path.join(CLIP_CACHE_DIR, f));
+          }
+        }
+      } catch {
+        // Ignore temp cleanup
+      }
+    }
+  })().finally(() => {
+    inFlightSourceDownloads.delete(urlHash);
+  });
+
+  inFlightSourceDownloads.set(urlHash, downloadTask);
+  return downloadTask;
+}
+
 async function extractClipSourceSegment(
   targetUrl: string,
   requestedStartSec: number,
@@ -517,14 +679,15 @@ async function extractClipSourceSegment(
   fs.mkdirSync(CLIP_CACHE_DIR, { recursive: true });
   pruneOldClipCache();
 
-  const safeDur = Math.min(Math.max(5, Number(requestedDurationSec) || 30), 65);
+  const blockedUntil = botBlockedUntilCache.get(targetUrl) || 0;
+  if (blockedUntil > Date.now() && !process.env.YOUTUBE_COOKIES?.trim()) {
+    throw new Error("YOUTUBE_BOT_CHECK: Upstream video host requires cookies on cloud IP.");
+  }
+
+  const safeDur = Math.min(Math.max(2, Number(requestedDurationSec) || 30), 120);
   let safeStart = Math.max(0, Number(requestedStartSec) || 0);
 
-  let knownDur = probedDurationCache.get(targetUrl);
-  if (!knownDur) {
-    const probed = await probeVideoMetadataWithYtDlp(targetUrl);
-    if (probed?.durationSec) knownDur = probed.durationSec;
-  }
+  const knownDur = probedDurationCache.get(targetUrl);
   if (knownDur && knownDur > 5) {
     safeStart = Math.min(safeStart, Math.max(0, knownDur - safeDur));
   }
@@ -545,60 +708,149 @@ async function extractClipSourceSegment(
   if (existing) return existing;
 
   const task = (async () => {
-    const ytDlp = await ensureYtDlpBinary();
     const ffmpegBin = getFfmpegExecutable();
-    const tmpBase = path.join(
-      CLIP_CACHE_DIR,
-      `${cacheKey}-${crypto.randomBytes(4).toString("hex")}`
-    );
-    const tmpTemplate = `${tmpBase}.%(ext)s`;
+    if (!ffmpegBin) {
+      throw new Error("ffmpeg binary is unavailable on server.");
+    }
 
-    const args = [
-      "--js-runtimes",
-      `node:${process.execPath}`,
-      "--no-warnings",
-      "--no-playlist",
-      ...(ffmpegBin ? ["--ffmpeg-location", ffmpegBin] : []),
-      "-f",
-      "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best",
-      "--download-sections",
-      `*${safeStart.toFixed(2)}-${endSec.toFixed(2)}`,
-      "--force-keyframes-at-cuts",
-      "--merge-output-format",
-      "mp4",
-      "-o",
-      tmpTemplate,
-      targetUrl,
-    ];
+    // Fast section-only extraction when dynamically-linked /usr/bin/ffmpeg is present
+    // (avoids downloading full 30-60m source video; ffmpeg-static segfaults on remote HTTPS sections).
+    if (fs.existsSync("/usr/bin/ffmpeg")) {
+      const ytDlp = await ensureYtDlpBinary();
+      const secPrefix = `sec-${cacheKey}-${crypto.randomBytes(4).toString("hex")}`;
+      const secTemplate = path.join(CLIP_CACHE_DIR, `${secPrefix}.%(ext)s`);
+      try {
+        await execFileAsync(
+          ytDlp,
+          [
+            "--js-runtimes",
+            `node:${process.execPath}`,
+            "--no-warnings",
+            "--no-playlist",
+            ...getYtDlpCookieArgs(),
+            "--ffmpeg-location",
+            "/usr/bin/ffmpeg",
+            "-f",
+            "bestvideo[height<=720][vcodec^=avc1]+bestaudio[acodec^=mp4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/18/best[ext=mp4]/best",
+            "--download-sections",
+            `*${safeStart.toFixed(2)}-${endSec.toFixed(2)}`,
+            "--force-keyframes-at-cuts",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            secTemplate,
+            targetUrl,
+          ],
+          { timeout: 40000, maxBuffer: 10 * 1024 * 1024 }
+        );
+        const secProduced = fs
+          .readdirSync(CLIP_CACHE_DIR)
+          .find((f) => f.startsWith(`${secPrefix}.`) && /\.(mp4|mkv|webm)$/i.test(f));
+        if (secProduced) {
+          const secPath = path.join(CLIP_CACHE_DIR, secProduced);
+          if (fs.statSync(secPath).size >= 4096) {
+            fs.renameSync(secPath, finalMp4Path);
+            return finalMp4Path;
+          }
+          fs.unlinkSync(secPath);
+        }
+      } catch (secErr) {
+        const msg = parseReadableError(secErr);
+        if (/not a bot|cookies/i.test(msg)) {
+          botBlockedUntilCache.set(targetUrl, Date.now() + 2 * 60 * 1000);
+          throw secErr;
+        }
+      } finally {
+        try {
+          for (const f of fs.readdirSync(CLIP_CACHE_DIR)) {
+            if (f.startsWith(`${secPrefix}.`)) {
+              fs.unlinkSync(path.join(CLIP_CACHE_DIR, f));
+            }
+          }
+        } catch {
+          // Ignore temp cleanup
+        }
+      }
+    }
+
+    const sourcePath = await ensureDownloadedSourceVideo(targetUrl);
+
+    const tmpOutPath = path.join(
+      CLIP_CACHE_DIR,
+      `${cacheKey}-${crypto.randomBytes(4).toString("hex")}.mp4`
+    );
 
     try {
-      await execFileAsync(ytDlp, args, {
-        timeout: 45000,
-        maxBuffer: 10 * 1024 * 1024,
-      });
-
-      const produced = fs
-        .readdirSync(CLIP_CACHE_DIR)
-        .find((f) => f.startsWith(path.basename(tmpBase)) && /\.(mp4|mkv|webm)$/i.test(f));
-
-      if (!produced) {
-        throw new Error("Clip extraction produced no video output.");
+      try {
+        // Re-encode locally with ultrafast H.264 + AAC so frame t=0 is a clean IDR keyframe and audio decodes reliably.
+        await execFileAsync(
+          ffmpegBin,
+          [
+            "-y",
+            "-ss",
+            safeStart.toFixed(2),
+            "-i",
+            sourcePath,
+            "-t",
+            safeDur.toFixed(2),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "21",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "12",
+            "-keyint_min",
+            "12",
+            "-c:a",
+            "aac",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
+            tmpOutPath,
+          ],
+          { timeout: 45000, maxBuffer: 10 * 1024 * 1024 }
+        );
+      } catch {
+        // Stream-copy fallback if fast re-encode fails
+        await execFileAsync(
+          ffmpegBin,
+          [
+            "-y",
+            "-ss",
+            safeStart.toFixed(2),
+            "-i",
+            sourcePath,
+            "-t",
+            safeDur.toFixed(2),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            tmpOutPath,
+          ],
+          { timeout: 25000, maxBuffer: 10 * 1024 * 1024 }
+        );
       }
 
-      const producedPath = path.join(CLIP_CACHE_DIR, produced);
-      if (fs.statSync(producedPath).size < 4096) {
-        fs.unlinkSync(producedPath);
+      if (!fs.existsSync(tmpOutPath) || fs.statSync(tmpOutPath).size < 4096) {
         throw new Error("Extracted clip segment was empty.");
       }
 
-      fs.renameSync(producedPath, finalMp4Path);
+      fs.renameSync(tmpOutPath, finalMp4Path);
       return finalMp4Path;
     } finally {
       try {
-        for (const f of fs.readdirSync(CLIP_CACHE_DIR)) {
-          if (f.startsWith(path.basename(tmpBase))) {
-            fs.unlinkSync(path.join(CLIP_CACHE_DIR, f));
-          }
+        if (fs.existsSync(tmpOutPath)) {
+          fs.unlinkSync(tmpOutPath);
         }
       } catch {
         // Ignore temp cleanup
@@ -1484,7 +1736,7 @@ async function startServer() {
       }
 
       const startSec = Math.max(0, Number(req.query.start) || 0);
-      const durationSec = Math.min(Math.max(5, Number(req.query.duration) || 30), 65);
+      const durationSec = Math.min(Math.max(2, Number(req.query.duration) || 30), 120);
       const ytId = extractYouTubeId(parsed.toString());
       const targetUrl = ytId
         ? `https://www.youtube.com/watch?v=${ytId}`
@@ -1498,6 +1750,152 @@ async function startServer() {
       res.status(502).json({
         error: parseReadableError(err) || "Could not extract source video segment.",
       });
+    }
+  });
+
+  app.post("/api/video/trim-local", async (req, res) => {
+    const ffmpegBin = getFfmpegExecutable();
+    if (!ffmpegBin) {
+      res.status(500).json({ error: "ffmpeg binary is unavailable on server." });
+      return;
+    }
+
+    const startSec = Math.max(0, Number(req.query.start) || 0);
+    const durationSec = Math.min(Math.max(2, Number(req.query.duration) || 30), 180);
+    const MAX_UPLOAD_BYTES = 220 * 1024 * 1024;
+
+    fs.mkdirSync(CLIP_CACHE_DIR, { recursive: true });
+    pruneOldClipCache();
+
+    const randId = crypto.randomBytes(6).toString("hex");
+    const tmpInPath = path.join(CLIP_CACHE_DIR, `local-in-${randId}.bin`);
+    const tmpOutPath = path.join(CLIP_CACHE_DIR, `local-out-${randId}.mp4`);
+    const cleanupFiles = () => {
+      try {
+        if (fs.existsSync(tmpInPath)) fs.unlinkSync(tmpInPath);
+      } catch {
+        // Ignore cleanup error
+      }
+      try {
+        if (fs.existsSync(tmpOutPath)) fs.unlinkSync(tmpOutPath);
+      } catch {
+        // Ignore cleanup error
+      }
+    };
+
+    try {
+      await new Promise<void>((resolve, reject) => {
+        let receivedBytes = 0;
+        let finished = false;
+        const out = fs.createWriteStream(tmpInPath);
+
+        const fail = (err: Error) => {
+          if (finished) return;
+          finished = true;
+          out.destroy();
+          reject(err);
+        };
+
+        req.on("data", (chunk: Buffer) => {
+          receivedBytes += chunk.length;
+          if (receivedBytes > MAX_UPLOAD_BYTES) {
+            req.destroy();
+            fail(new Error("LIMIT_EXCEEDED: File exceeds 220MB limit for server trim."));
+            return;
+          }
+          if (!out.write(chunk)) {
+            req.pause();
+            out.once("drain", () => req.resume());
+          }
+        });
+
+        req.on("end", () => {
+          out.end(() => {
+            if (!finished) {
+              finished = true;
+              if (receivedBytes < 4096) {
+                reject(new Error("Uploaded video segment was empty."));
+              } else {
+                resolve();
+              }
+            }
+          });
+        });
+
+        req.on("error", (err) => fail(err));
+        out.on("error", (err) => fail(err));
+      });
+
+      try {
+        await execFileAsync(
+          ffmpegBin,
+          [
+            "-y",
+            "-ss",
+            startSec.toFixed(2),
+            "-i",
+            tmpInPath,
+            "-t",
+            durationSec.toFixed(2),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "19",
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            "12",
+            "-keyint_min",
+            "12",
+            "-c:a",
+            "aac",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            tmpOutPath,
+          ],
+          { timeout: 60000, maxBuffer: 10 * 1024 * 1024 }
+        );
+      } catch {
+        await execFileAsync(
+          ffmpegBin,
+          [
+            "-y",
+            "-ss",
+            startSec.toFixed(2),
+            "-i",
+            tmpInPath,
+            "-t",
+            durationSec.toFixed(2),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            tmpOutPath,
+          ],
+          { timeout: 30000, maxBuffer: 10 * 1024 * 1024 }
+        );
+      }
+
+      if (!fs.existsSync(tmpOutPath) || fs.statSync(tmpOutPath).size < 4096) {
+        throw new Error("Could not trim uploaded video clip.");
+      }
+
+      res.setHeader("Content-Type", "video/mp4");
+      res.sendFile(tmpOutPath, () => {
+        cleanupFiles();
+      });
+    } catch (err) {
+      cleanupFiles();
+      const msg = parseReadableError(err) || "Failed to trim local video.";
+      res.status(msg.includes("LIMIT_EXCEEDED") ? 413 : 500).json({ error: msg });
     }
   });
 
@@ -1591,7 +1989,7 @@ async function startServer() {
           // Graceful fallback
         }
 
-        if (process.env.GEMINI_API_KEY && title === "Untitled Video Stream") {
+        if (getConfiguredGeminiApiKey() && title === "Untitled Video Stream") {
           try {
             const ai = getGeminiClient();
             const searchRes = await callGeminiWithFallback(
@@ -2019,6 +2417,82 @@ ${JSON.stringify({ title, hookTitle, transcript })}`,
       res.json(parsed);
     } catch (err) {
       res.status(500).json({ error: parseReadableError(err) });
+    }
+  });
+
+  app.post("/api/clips/voiceover", async (req, res) => {
+    try {
+      const ai = getGeminiClient();
+      const {
+        text = "",
+        language = "English",
+        voiceName = "Puck",
+      } = req.body as {
+        text?: string;
+        language?: string;
+        voiceName?: string;
+      };
+
+      const cleanedText = String(text || "").replace(/\s+/g, " ").trim().slice(0, 2400);
+      if (!cleanedText) {
+        res.status(400).json({ error: "Voiceover text is required." });
+        return;
+      }
+
+      const allowedVoices = new Set(["Puck", "Charon", "Kore", "Fenrir", "Zephyr"]);
+      const selectedVoice = allowedVoices.has(voiceName) ? voiceName : "Puck";
+      const safeLanguage = String(language || "English").trim().slice(0, 48) || "English";
+
+      const ttsResponse = await withAttemptTimeout(
+        (signal) =>
+          ai.models.generateContent({
+            model: "gemini-3.8-flash-lite-tts",
+            contents: [
+              {
+                role: "user",
+                parts: [
+                  {
+                    text: cleanedText,
+                    speechMetadata: {
+                      style: `Energetic, clear short-form video creator voiceover in ${safeLanguage} with natural conversational pacing`,
+                    },
+                  },
+                ],
+              },
+            ],
+            config: {
+              abortSignal: signal,
+              responseModalities: ["AUDIO"],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: selectedVoice },
+                },
+              },
+            },
+          }),
+        30000,
+        "gemini-3.8-flash-lite-tts"
+      );
+
+      const base64Audio =
+        ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      if (!base64Audio) {
+        res.status(502).json({ error: "TTS service returned no audio data." });
+        return;
+      }
+
+      const wavBuffer = Buffer.from(base64Audio, "base64");
+      if (wavBuffer.length < 64) {
+        res.status(502).json({ error: "Generated voiceover audio was empty." });
+        return;
+      }
+
+      res.setHeader("Content-Type", "audio/wav");
+      res.setHeader("Content-Length", String(wavBuffer.length));
+      res.setHeader("Cache-Control", "private, max-age=600");
+      res.send(wavBuffer);
+    } catch (err) {
+      res.status(502).json({ error: parseReadableError(err) || "Failed to generate voiceover." });
     }
   });
 

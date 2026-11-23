@@ -12,9 +12,7 @@ import {
   Check,
   Languages,
   Loader2,
-  FileText,
   Film,
-  Image as ImageIcon,
   Subtitles,
   CalendarClock,
   Youtube,
@@ -23,6 +21,7 @@ import {
   Hash,
   Sparkles,
   Upload,
+  RotateCcw,
 } from "lucide-react";
 import {
   AspectRatio,
@@ -34,14 +33,11 @@ import {
 import { CAPTION_STYLES, SUPPORTED_LANGUAGES } from "../data/presets";
 import { ClipPlayer } from "./ClipPlayer";
 import {
-  downloadCoverPng,
   downloadSrtSubtitles,
-  downloadTranscriptTxt,
-  downloadVttSubtitles,
   formatTime,
   isDirectVideoUrl,
   renderAndDownloadMp4Clip,
-  renderAndDownloadWebmClip,
+  renderAndDownloadOriginalCutMp4,
 } from "../utils/exportClip";
 import { getClipHashtags, normalizeHashtag } from "../utils/hashtags";
 import { apiUrl } from "../utils/api";
@@ -265,7 +261,10 @@ const ClipCard: React.FC<ClipCardProps> = ({
   const [copied, setCopied] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const [renderPct, setRenderPct] = useState<number | null>(null);
+  const [renderStage, setRenderStage] = useState<string | null>(null);
+  const [lastDownloadAction, setLastDownloadAction] = useState<"original" | "captioned" | null>(null);
   const [exportErr, setExportErr] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
   const [targetLang, setTargetLang] = useState("Spanish");
   const [isTranslating, setIsTranslating] = useState(false);
   const [translateErr, setTranslateErr] = useState<string | null>(null);
@@ -274,11 +273,6 @@ const ClipCard: React.FC<ClipCardProps> = ({
   const [copiedTags, setCopiedTags] = useState(false);
   const exportMenuRef = useRef<HTMLDivElement | null>(null);
   const attachVideoInputRef = useRef<HTMLInputElement | null>(null);
-  const hasSourceVideoMedia = Boolean(
-    project.localVideoUrl ||
-      isDirectVideoUrl(project.url) ||
-      (!project.isDemo && (project.youtubeId || project.url))
-  );
 
   useEffect(() => {
     if (!exportOpen) return;
@@ -344,39 +338,59 @@ const ClipCard: React.FC<ClipCardProps> = ({
     }
   };
 
-  const handleVideoDownload = async (format: "mp4" | "webm") => {
+  const handleOriginalCutDownload = async () => {
     setExportOpen(false);
     setExportErr(null);
+    setExportNotice(null);
+    setLastDownloadAction("original");
     setRenderPct(0);
+    setRenderStage("Checking video...");
     try {
-      if (format === "mp4") {
-        await renderAndDownloadMp4Clip(clip, project, (pct) => setRenderPct(pct));
-      } else {
-        await renderAndDownloadWebmClip(clip, project, (pct) => setRenderPct(pct));
+      const res = await renderAndDownloadOriginalCutMp4(clip, project, (pct, stage) => {
+        setRenderPct(pct);
+        if (stage) setRenderStage(stage);
+      });
+      if (!res.hasAudioTrack) {
+        setExportNotice(
+          "Original Cut downloaded, but the source video file itself has no audio track."
+        );
       }
     } catch (err) {
       setExportErr(
-        err instanceof Error
-          ? err.message
-          : `Could not render ${format.toUpperCase()} video.`
+        err instanceof Error ? err.message : "Could not download original cut video."
       );
     } finally {
       setRenderPct(null);
+      setRenderStage(null);
     }
   };
 
-  const handleCoverPngDownload = async () => {
+  const handleVideoDownload = async () => {
     setExportOpen(false);
     setExportErr(null);
+    setExportNotice(null);
+    setLastDownloadAction("captioned");
     setRenderPct(0);
+    setRenderStage("Checking video...");
     try {
-      await downloadCoverPng(clip, project);
+      const summary = await renderAndDownloadMp4Clip(clip, project, (pct, stage) => {
+        setRenderPct(pct);
+        if (stage) setRenderStage(stage);
+      });
+      if (!summary.usedAudio) {
+        setExportNotice(
+          summary.voiceoverError
+            ? `Video exported without audio (${summary.voiceoverError}).`
+            : "Video exported without an audio track."
+        );
+      }
     } catch (err) {
       setExportErr(
-        err instanceof Error ? err.message : "Could not export PNG cover image."
+        err instanceof Error ? err.message : "Could not render MP4 video."
       );
     } finally {
       setRenderPct(null);
+      setRenderStage(null);
     }
   };
 
@@ -493,8 +507,10 @@ const ClipCard: React.FC<ClipCardProps> = ({
               >
                 {renderPct !== null ? (
                   <>
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                    {renderPct}%
+                    <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                    <span className="truncate">
+                      {renderStage ? `${renderStage.replace(/\.\.\.$/, "")} ${renderPct}%` : `${renderPct}%`}
+                    </span>
                   </>
                 ) : (
                   <>
@@ -504,45 +520,48 @@ const ClipCard: React.FC<ClipCardProps> = ({
                 )}
               </button>
 
+              <input
+                ref={attachVideoInputRef}
+                type="file"
+                accept="video/*"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (!file) return;
+                  const url = URL.createObjectURL(file);
+                  onAttachSourceVideo(url);
+                  setExportErr(null);
+                  setExportNotice(null);
+                  e.target.value = "";
+                }}
+              />
+
               {exportOpen && (
-                <div className="absolute left-0 bottom-11 w-60 z-30 rounded-lg bg-[#18181F] border border-[#2D2D38] p-1.5 shadow-xl space-y-0.5">
+                <div className="absolute left-0 bottom-11 w-64 z-30 rounded-lg bg-[#18181F] border border-[#2D2D38] p-1.5 shadow-xl space-y-0.5">
                   <button
                     type="button"
                     disabled={renderPct !== null}
-                    onClick={() => handleVideoDownload("mp4")}
+                    onClick={handleOriginalCutDownload}
+                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 disabled:opacity-50 text-xs text-zinc-100 flex items-center justify-between gap-2"
+                  >
+                    <span className="flex items-center gap-2 font-medium">
+                      <Film className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                      Original Cut (.mp4)
+                    </span>
+                    <span className="text-[10px] font-mono text-emerald-400/90">Raw</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={renderPct !== null}
+                    onClick={handleVideoDownload}
                     className="w-full text-left px-3 py-2 rounded hover:bg-white/5 disabled:opacity-50 text-xs text-zinc-100 flex items-center justify-between gap-2"
                   >
                     <span className="flex items-center gap-2 font-medium">
                       <Film className="w-3.5 h-3.5 text-blue-400 shrink-0" />
-                      Video (.mp4)
+                      Captioned Video (.mp4)
                     </span>
                     <span className="text-[10px] font-mono text-zinc-400">H.264</span>
                   </button>
-                  <button
-                    type="button"
-                    disabled={renderPct !== null}
-                    onClick={() => handleVideoDownload("webm")}
-                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 disabled:opacity-50 text-xs text-zinc-100 flex items-center justify-between gap-2"
-                  >
-                    <span className="flex items-center gap-2 font-medium">
-                      <Film className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                      Video (.webm)
-                    </span>
-                    <span className="text-[10px] font-mono text-zinc-400">VP9</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={renderPct !== null}
-                    onClick={handleCoverPngDownload}
-                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 disabled:opacity-50 text-xs text-zinc-100 flex items-center justify-between gap-2"
-                  >
-                    <span className="flex items-center gap-2 font-medium">
-                      <ImageIcon className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                      Cover Image (.png)
-                    </span>
-                    <span className="text-[10px] font-mono text-zinc-400">Frame</span>
-                  </button>
-                  <div className="my-1 border-t border-[#282833]" />
                   <button
                     type="button"
                     onClick={() => {
@@ -557,62 +576,16 @@ const ClipCard: React.FC<ClipCardProps> = ({
                     </span>
                     <span className="text-[10px] font-mono text-zinc-500">SubRip</span>
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      downloadVttSubtitles(clip);
-                      setExportOpen(false);
-                    }}
-                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center justify-between gap-2"
-                  >
-                    <span className="flex items-center gap-2">
-                      <Subtitles className="w-3.5 h-3.5 text-violet-400 shrink-0" />
-                      Subtitles (.vtt)
-                    </span>
-                    <span className="text-[10px] font-mono text-zinc-500">WebVTT</span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      downloadTranscriptTxt(clip);
-                      setExportOpen(false);
-                    }}
-                    className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-zinc-100 flex items-center justify-between gap-2"
-                  >
-                    <span className="flex items-center gap-2">
-                      <FileText className="w-3.5 h-3.5 text-zinc-400 shrink-0" />
-                      Transcript (.txt)
-                    </span>
-                    <span className="text-[10px] font-mono text-zinc-500">Text</span>
-                  </button>
-                  <div className="my-1 border-t border-[#282833]" />
-                  {hasSourceVideoMedia ? (
-                    <div className="px-3 py-1.5 text-[10px] text-emerald-400/90 flex items-center justify-between">
-                      <span>Source video + audio ready</span>
-                      <span className="font-mono">720p</span>
-                    </div>
-                  ) : (
+                  {!project.localVideoUrl && !isDirectVideoUrl(project.url) && (
                     <>
-                      <input
-                        ref={attachVideoInputRef}
-                        type="file"
-                        accept="video/*"
-                        className="hidden"
-                        onChange={(e) => {
-                          const file = e.target.files?.[0];
-                          if (!file) return;
-                          const url = URL.createObjectURL(file);
-                          onAttachSourceVideo(url);
-                          e.target.value = "";
-                        }}
-                      />
+                      <div className="my-1 border-t border-[#282833]" />
                       <button
                         type="button"
                         onClick={() => attachVideoInputRef.current?.click()}
-                        className="w-full text-left px-3 py-1.5 rounded hover:bg-white/5 text-[11px] text-amber-300 flex items-center gap-1.5"
+                        className="w-full text-left px-3 py-2 rounded hover:bg-white/5 text-xs text-amber-300 flex items-center gap-2"
                       >
-                        <Upload className="w-3 h-3 shrink-0" />
-                        <span>Attach MP4 for full video+audio</span>
+                        <Upload className="w-3.5 h-3.5 shrink-0" />
+                        <span>Attach original MP4</span>
                       </button>
                     </>
                   )}
@@ -639,7 +612,53 @@ const ClipCard: React.FC<ClipCardProps> = ({
             </button>
           </div>
           {exportErr && (
-            <p className="text-[11px] text-red-400 max-w-[248px]">{exportErr}</p>
+            <div className="max-w-[248px] space-y-1.5 rounded-lg bg-red-500/10 border border-red-500/30 p-2">
+              <p className="text-[11px] text-red-300 leading-snug">{exportErr}</p>
+              <div className="flex flex-wrap items-center gap-3">
+                {lastDownloadAction && (
+                  <button
+                    type="button"
+                    disabled={renderPct !== null}
+                    onClick={() =>
+                      lastDownloadAction === "original"
+                        ? handleOriginalCutDownload()
+                        : handleVideoDownload()
+                    }
+                    className="text-[11px] font-medium text-blue-300 hover:text-blue-200 underline inline-flex items-center gap-1"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    Retry
+                  </button>
+                )}
+                {!project.localVideoUrl && (
+                  <button
+                    type="button"
+                    onClick={() => attachVideoInputRef.current?.click()}
+                    className="text-[11px] font-medium text-amber-300 hover:text-amber-200 underline inline-flex items-center gap-1"
+                  >
+                    <Upload className="w-3 h-3" />
+                    Attach original MP4
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+          {exportNotice && !exportErr && (
+            <div className="max-w-[248px] space-y-1.5 rounded-lg bg-amber-500/10 border border-amber-500/25 p-2">
+              <p className="text-[11px] text-amber-200/95 leading-snug">
+                {exportNotice}
+              </p>
+              {!project.localVideoUrl && (
+                <button
+                  type="button"
+                  onClick={() => attachVideoInputRef.current?.click()}
+                  className="text-[11px] font-medium text-amber-300 hover:text-amber-200 underline inline-flex items-center gap-1"
+                >
+                  <Upload className="w-3 h-3" />
+                  Attach original MP4 for full video+audio
+                </button>
+              )}
+            </div>
           )}
         </div>
 

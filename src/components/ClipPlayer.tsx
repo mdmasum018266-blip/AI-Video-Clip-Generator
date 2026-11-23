@@ -1,5 +1,16 @@
 import React, { useEffect, useId, useMemo, useRef, useState } from "react";
-import { Pause, Play, Volume2, VolumeX, Film } from "lucide-react";
+import {
+  Pause,
+  Play,
+  Volume2,
+  VolumeX,
+  Film,
+  Maximize2,
+  Minimize2,
+  Loader2,
+  RotateCcw,
+  AlertCircle,
+} from "lucide-react";
 import { ClipItem, VideoProject } from "../types";
 import { ASSET_IMAGES, normalizeAssetUrl } from "../data/assetImages";
 import { BACKGROUND_VIDEOS } from "../data/presets";
@@ -13,6 +24,8 @@ interface YTPlayerInstance {
   getCurrentTime: () => number;
   mute: () => void;
   unMute: () => void;
+  setVolume?: (volume: number) => void;
+  setPlaybackRate?: (suggestedRate: number) => void;
   destroy: () => void;
 }
 
@@ -62,6 +75,8 @@ function loadYouTubeIframeApi(): Promise<void> {
   return ytApiPromise;
 }
 
+const SPEED_OPTIONS = [0.75, 1, 1.25, 1.5, 2] as const;
+
 interface ClipPlayerProps {
   clip: ClipItem;
   project: VideoProject;
@@ -82,13 +97,19 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [audioOn, setAudioOn] = useState(true);
+  const [volume, setVolume] = useState(0.9);
+  const [playbackRate, setPlaybackRate] = useState<number>(1);
+  const [isFullscreen, setIsFullscreen] = useState(false);
   const [imgFailed, setImgFailed] = useState(false);
   const [localVideoFailed, setLocalVideoFailed] = useState(false);
+  const [localVideoLoading, setLocalVideoLoading] = useState(false);
   const [ytActivated, setYtActivated] = useState(false);
   const [ytReady, setYtReady] = useState(false);
   const [ytPlaying, setYtPlaying] = useState(false);
   const [ytError, setYtError] = useState(false);
+  const [retrySeq, setRetrySeq] = useState(0);
 
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const ytPlayerRef = useRef<YTPlayerInstance | null>(null);
   const lastSpokenCueId = useRef<string | null>(null);
@@ -96,6 +117,10 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
   onTimeUpdateRef.current = onTimeUpdate;
   const audioOnRef = useRef(audioOn);
   audioOnRef.current = audioOn;
+  const volumeRef = useRef(volume);
+  volumeRef.current = volume;
+  const playbackRateRef = useRef(playbackRate);
+  playbackRateRef.current = playbackRate;
   const currentTimeRef = useRef(currentTime);
   currentTimeRef.current = currentTime;
   const isPlayingRef = useRef(isPlaying);
@@ -109,12 +134,21 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
     setCurrentTime(0);
     setImgFailed(false);
     setLocalVideoFailed(false);
+    setLocalVideoLoading(Boolean(project.localVideoUrl));
     setYtActivated(false);
     setYtReady(false);
     setYtPlaying(false);
     setYtError(false);
     lastSpokenCueId.current = null;
   }, [clip.id, project.localVideoUrl, project.youtubeId]);
+
+  useEffect(() => {
+    const onFsChange = () => {
+      setIsFullscreen(Boolean(document.fullscreenElement && document.fullscreenElement === containerRef.current));
+    };
+    document.addEventListener("fullscreenchange", onFsChange);
+    return () => document.removeEventListener("fullscreenchange", onFsChange);
+  }, []);
 
   const effectiveDuration = useMemo(() => {
     const lastCueEnd = clip.transcript[clip.transcript.length - 1]?.endOffsetSec ?? 0;
@@ -123,6 +157,12 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
 
   const useLocalVideo = Boolean(project.localVideoUrl) && !localVideoFailed;
   const useYouTubeEmbed = Boolean(project.youtubeId) && !useLocalVideo && !ytError;
+  const hasVideoSourceError =
+    (Boolean(project.localVideoUrl) && localVideoFailed) ||
+    (Boolean(project.youtubeId) && !project.localVideoUrl && ytError);
+  const isBuffering =
+    (useLocalVideo && localVideoLoading) ||
+    (useYouTubeEmbed && ytActivated && !ytReady && !ytError);
 
   // Lazy-initialize real YouTube IFrame Player only once user hits Play/seek
   useEffect(() => {
@@ -153,8 +193,13 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
               ready = true;
               window.clearTimeout(stallTimer);
               setYtReady(true);
-              if (!audioOnRef.current) e.target.mute();
-              else e.target.unMute();
+              if (!audioOnRef.current || volumeRef.current <= 0) {
+                e.target.mute();
+              } else {
+                e.target.unMute();
+                e.target.setVolume?.(Math.round(volumeRef.current * 100));
+              }
+              e.target.setPlaybackRate?.(playbackRateRef.current);
               if (currentTimeRef.current > 0.2) {
                 e.target.seekTo(startTimeRef.current + currentTimeRef.current, true);
               }
@@ -184,7 +229,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
           if (!cancelled && !ready) {
             setYtError(true);
           }
-        }, 5000);
+        }, 7000);
       } catch {
         setYtError(true);
       }
@@ -204,18 +249,26 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       setYtReady(false);
       setYtPlaying(false);
     };
-  }, [useYouTubeEmbed, ytActivated, project.youtubeId, ytDomId]);
+  }, [useYouTubeEmbed, ytActivated, project.youtubeId, ytDomId, retrySeq]);
 
-  // Sync mute state on YouTube or local video
+  // Sync mute, volume, and playback speed on YouTube or local video
   useEffect(() => {
+    const effectiveVol = audioOn ? volume : 0;
     if (ytPlayerRef.current && ytReady) {
-      if (audioOn) ytPlayerRef.current.unMute();
-      else ytPlayerRef.current.mute();
+      if (effectiveVol <= 0) {
+        ytPlayerRef.current.mute();
+      } else {
+        ytPlayerRef.current.unMute();
+        ytPlayerRef.current.setVolume?.(Math.round(effectiveVol * 100));
+      }
+      ytPlayerRef.current.setPlaybackRate?.(playbackRate);
     }
     if (videoRef.current) {
-      videoRef.current.muted = !audioOn;
+      videoRef.current.muted = !audioOn || volume <= 0;
+      videoRef.current.volume = Math.min(1, Math.max(0, volume));
+      videoRef.current.playbackRate = playbackRate;
     }
-  }, [audioOn, ytReady]);
+  }, [audioOn, volume, playbackRate, ytReady]);
 
   // External seek from clicking transcript cue
   const seekTarget = externalSeek ? externalSeek.sec : externalSeekSec;
@@ -261,6 +314,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       if (Math.abs(vid.currentTime - target) > 0.6) {
         vid.currentTime = target;
       }
+      vid.playbackRate = playbackRate;
       vid.play().catch(() => {});
     }
 
@@ -273,6 +327,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
         ) {
           ytPlayerRef.current.seekTo(clip.startTimeSec + currentTime, true);
         }
+        ytPlayerRef.current.setPlaybackRate?.(playbackRate);
         ytPlayerRef.current.playVideo();
       } catch {
         // Ignore
@@ -321,7 +376,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       }
 
       setCurrentTime((prev) => {
-        const next = prev + 0.1;
+        const next = prev + 0.1 * playbackRate;
         if (next >= effectiveDuration) {
           setIsPlaying(false);
           if (videoRef.current) videoRef.current.pause();
@@ -342,6 +397,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
     useYouTubeEmbed,
     ytReady,
     ytPlaying,
+    playbackRate,
   ]);
 
   useEffect(() => {
@@ -358,7 +414,7 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
 
   // Web Speech API fallback only when neither local video nor active YouTube embed is used
   useEffect(() => {
-    if (!audioOn || !isPlaying || useLocalVideo || (useYouTubeEmbed && !ytError)) {
+    if (!audioOn || volume <= 0 || !isPlaying || useLocalVideo || (useYouTubeEmbed && !ytError)) {
       if (typeof window !== "undefined" && "speechSynthesis" in window) {
         window.speechSynthesis.cancel();
       }
@@ -369,11 +425,12 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       if ("speechSynthesis" in window) {
         window.speechSynthesis.cancel();
         const utter = new SpeechSynthesisUtterance(activeCue.text);
-        utter.rate = 1.08;
+        utter.rate = Math.min(2, Math.max(0.75, 1.05 * playbackRate));
+        utter.volume = Math.min(1, Math.max(0, volume));
         window.speechSynthesis.speak(utter);
       }
     }
-  }, [audioOn, isPlaying, activeCue, useLocalVideo, useYouTubeEmbed, ytError]);
+  }, [audioOn, volume, playbackRate, isPlaying, activeCue, useLocalVideo, useYouTubeEmbed, ytError]);
 
   useEffect(() => {
     return () => {
@@ -414,40 +471,86 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
       ? "aspect-square"
       : "aspect-video";
 
-  const widthClass =
-    size === "editor"
-      ? clip.aspectRatio === "9:16"
-        ? "w-[260px] sm:w-[290px]"
-        : clip.aspectRatio === "1:1"
-        ? "w-[320px] sm:w-[360px]"
-        : "w-full max-w-[480px]"
-      : clip.aspectRatio === "9:16"
-      ? "w-[230px] sm:w-[248px]"
+  const widthClass = isFullscreen
+    ? "w-full h-full max-w-none"
+    : size === "editor"
+    ? clip.aspectRatio === "9:16"
+      ? "w-[260px] sm:w-[290px]"
       : clip.aspectRatio === "1:1"
-      ? "w-[260px] sm:w-[280px]"
-      : "w-full max-w-[360px]";
+      ? "w-[320px] sm:w-[360px]"
+      : "w-full max-w-[480px]"
+    : clip.aspectRatio === "9:16"
+    ? "w-[230px] sm:w-[248px]"
+    : clip.aspectRatio === "1:1"
+    ? "w-[260px] sm:w-[280px]"
+    : "w-full max-w-[360px]";
 
   // Compute cropped horizontal offset for 16:9 YouTube iframe inside 9:16 or 1:1 container
   const ytCropShift = ((50 - clip.focalPointX) * 0.45).toFixed(1);
+
+  const handleRetrySource = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setLocalVideoFailed(false);
+    setYtError(false);
+    setYtReady(false);
+    setYtPlaying(false);
+    if (project.localVideoUrl) {
+      setLocalVideoLoading(true);
+    }
+    if (project.youtubeId) {
+      setYtActivated(true);
+    }
+    setRetrySeq((n) => n + 1);
+  };
+
+  const handleToggleFullscreen = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const el = containerRef.current;
+    if (!el) return;
+    if (document.fullscreenElement === el) {
+      document.exitFullscreen?.().catch(() => {});
+    } else {
+      el.requestFullscreen?.().catch(() => {});
+    }
+  };
+
+  const handleCycleSpeed = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const idx = SPEED_OPTIONS.indexOf(playbackRate as (typeof SPEED_OPTIONS)[number]);
+    const next = SPEED_OPTIONS[(idx + 1) % SPEED_OPTIONS.length];
+    setPlaybackRate(next);
+  };
 
   const renderPrimaryVideoLayer = () => {
     if (useLocalVideo && project.localVideoUrl) {
       return (
         <video
+          key={`local-${retrySeq}`}
           ref={videoRef}
           src={project.localVideoUrl}
-          muted={!audioOn}
+          muted={!audioOn || volume <= 0}
           playsInline
           preload="metadata"
+          onLoadStart={() => setLocalVideoLoading(true)}
+          onWaiting={() => setLocalVideoLoading(true)}
+          onCanPlay={() => setLocalVideoLoading(false)}
+          onPlaying={() => setLocalVideoLoading(false)}
           onLoadedMetadata={(e) => {
+            setLocalVideoLoading(false);
             const vid = e.currentTarget;
+            vid.volume = Math.min(1, Math.max(0, volume));
+            vid.playbackRate = playbackRate;
             const dur = Number.isFinite(vid.duration) && vid.duration > 0 ? vid.duration : 0;
             const safeStart = dur > 2 ? Math.min(clip.startTimeSec, Math.max(0, dur - 2)) : 0;
             if (safeStart > 0.1) {
               vid.currentTime = safeStart;
             }
           }}
-          onError={() => setLocalVideoFailed(true)}
+          onError={() => {
+            setLocalVideoLoading(false);
+            setLocalVideoFailed(true);
+            setIsPlaying(false);
+          }}
           className="w-full h-full object-cover"
           style={{
             objectPosition: `${clip.focalPointX}% center`,
@@ -520,7 +623,10 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
 
   return (
     <div
-      className={`relative ${widthClass} ${aspectClass} rounded-xl overflow-hidden bg-[#0E0E12] border border-[#27272E] shrink-0 group select-none`}
+      ref={containerRef}
+      className={`relative ${widthClass} ${
+        isFullscreen ? "" : aspectClass
+      } rounded-xl overflow-hidden bg-[#0E0E12] border border-[#27272E] shrink-0 group select-none`}
     >
       {/* Visual Layer */}
       {clip.splitScreen && clip.aspectRatio === "9:16" ? (
@@ -557,30 +663,60 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
         </div>
       )}
 
+      {/* Buffering / Loading Indicator */}
+      {isBuffering && !hasVideoSourceError && (
+        <div className="absolute inset-0 z-15 flex items-center justify-center pointer-events-none">
+          <div className="px-2.5 py-1 rounded-full bg-black/75 border border-white/15 text-[11px] text-zinc-200 inline-flex items-center gap-1.5 backdrop-blur-xs">
+            <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />
+            Loading video...
+          </div>
+        </div>
+      )}
+
+      {/* Error State & Retry Overlay */}
+      {hasVideoSourceError && (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 bg-black/75 backdrop-blur-xs p-4 text-center">
+          <AlertCircle className="w-6 h-6 text-amber-400" />
+          <p className="text-xs text-zinc-200 font-medium">
+            Preview stream could not load
+          </p>
+          <button
+            type="button"
+            onClick={handleRetrySource}
+            className="px-3 py-1.5 rounded-lg bg-blue-600 hover:bg-blue-500 text-[11px] font-semibold text-white inline-flex items-center gap-1.5 transition-colors"
+          >
+            <RotateCcw className="w-3 h-3" />
+            Retry preview
+          </button>
+        </div>
+      )}
+
       {/* Center Play / Pause Button */}
-      <button
-        type="button"
-        onClick={() => {
-          if (useYouTubeEmbed && !ytActivated) {
-            setYtActivated(true);
-          }
-          setIsPlaying((p) => !p);
-        }}
-        aria-label={isPlaying ? "Pause clip preview" : "Play clip preview"}
-        className={`absolute inset-0 z-10 flex items-center justify-center transition-opacity duration-150 ${
-          isPlaying ? "opacity-0 group-hover:opacity-100" : "opacity-100"
-        }`}
-      >
-        <span className="w-12 h-12 rounded-full bg-black/70 hover:bg-blue-600 border border-white/25 flex items-center justify-center text-white backdrop-blur-xs transition-colors">
-          {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
-        </span>
-      </button>
+      {!hasVideoSourceError && (
+        <button
+          type="button"
+          onClick={() => {
+            if (useYouTubeEmbed && !ytActivated) {
+              setYtActivated(true);
+            }
+            setIsPlaying((p) => !p);
+          }}
+          aria-label={isPlaying ? "Pause clip preview" : "Play clip preview"}
+          className={`absolute inset-0 z-10 flex items-center justify-center transition-opacity duration-150 ${
+            isPlaying ? "opacity-0 group-hover:opacity-100" : "opacity-100"
+          }`}
+        >
+          <span className="w-12 h-12 rounded-full bg-black/70 hover:bg-blue-600 border border-white/25 flex items-center justify-center text-white backdrop-blur-xs transition-colors">
+            {isPlaying ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 ml-0.5" />}
+          </span>
+        </button>
+      )}
 
       {/* Animated Caption Overlay */}
       {activeCue && (
         <div
           className={`absolute left-3 right-3 z-10 pointer-events-none flex justify-center ${
-            clip.splitScreen && clip.aspectRatio === "9:16" ? "top-1/2 -translate-y-1/2" : "bottom-11"
+            clip.splitScreen && clip.aspectRatio === "9:16" ? "top-1/2 -translate-y-1/2" : "bottom-12"
           }`}
         >
           <CaptionPreview
@@ -593,8 +729,8 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
         </div>
       )}
 
-      {/* Bottom Scrubber & Audio Toggle */}
-      <div className="absolute bottom-0 inset-x-0 z-20 px-2.5 pb-2 pt-4 bg-gradient-to-t from-black/90 to-transparent flex flex-col gap-1.5">
+      {/* Bottom Scrubber, Volume, Speed & Fullscreen Controls */}
+      <div className="absolute bottom-0 inset-x-0 z-20 px-2.5 pb-2 pt-5 bg-gradient-to-t from-black/95 via-black/75 to-transparent flex flex-col gap-1.5">
         <input
           type="range"
           min={0}
@@ -618,26 +754,65 @@ export const ClipPlayer: React.FC<ClipPlayerProps> = ({
           }}
           className="w-full h-1 accent-blue-500 cursor-pointer bg-white/25 rounded-full"
         />
-        <div className="flex items-center justify-between text-[11px] font-mono tabular-nums text-zinc-300">
-          <span>
-            {formatTime(currentTime)} / {formatTime(clip.durationSec)}
+        <div className="flex items-center justify-between gap-1 text-[11px] font-mono tabular-nums text-zinc-300">
+          <span className="truncate">
+            {formatTime(currentTime)} / {formatTime(effectiveDuration)}
           </span>
-          <button
-            type="button"
-            onClick={(e) => {
-              e.stopPropagation();
-              setAudioOn((v) => !v);
-            }}
-            title={audioOn ? "Mute clip audio" : "Unmute clip audio"}
-            className="flex items-center gap-1 px-1.5 py-0.5 rounded hover:bg-white/10 text-zinc-200 transition-colors"
-          >
-            {audioOn ? (
-              <Volume2 className="w-3.5 h-3.5 text-blue-400" />
-            ) : (
-              <VolumeX className="w-3.5 h-3.5 text-zinc-400" />
-            )}
-            <span className="text-[10px] font-sans">{audioOn ? "Audio On" : "Muted"}</span>
-          </button>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={handleCycleSpeed}
+              title="Change playback speed"
+              aria-label={`Playback speed ${playbackRate}x`}
+              className="px-1.5 py-0.5 rounded hover:bg-white/15 text-[10px] font-mono text-zinc-200 transition-colors"
+            >
+              {playbackRate}x
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setAudioOn((v) => !v);
+              }}
+              title={audioOn ? "Mute clip audio" : "Unmute clip audio"}
+              aria-label={audioOn ? "Mute clip audio" : "Unmute clip audio"}
+              className="p-1 rounded hover:bg-white/15 text-zinc-200 transition-colors"
+            >
+              {audioOn && volume > 0 ? (
+                <Volume2 className="w-3.5 h-3.5 text-blue-400" />
+              ) : (
+                <VolumeX className="w-3.5 h-3.5 text-zinc-400" />
+              )}
+            </button>
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              value={audioOn ? volume : 0}
+              aria-label="Preview volume"
+              onClick={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                const nextVol = Number(e.target.value);
+                setVolume(nextVol);
+                setAudioOn(nextVol > 0);
+              }}
+              className="w-10 h-1 accent-blue-500 cursor-pointer bg-white/25 rounded-full hidden sm:block"
+            />
+            <button
+              type="button"
+              onClick={handleToggleFullscreen}
+              title={isFullscreen ? "Exit fullscreen" : "Fullscreen preview"}
+              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen preview"}
+              className="p-1 rounded hover:bg-white/15 text-zinc-200 transition-colors"
+            >
+              {isFullscreen ? (
+                <Minimize2 className="w-3.5 h-3.5" />
+              ) : (
+                <Maximize2 className="w-3.5 h-3.5" />
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </div>
